@@ -59,6 +59,7 @@
 #include <linux/pagemap.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
+#include <linux/memcompress.h>
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/ksm.h>
@@ -1798,7 +1799,9 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 			}
 			pteval = huge_ptep_clear_flush(vma, address, pvmw.pte);
 		} else {
-			if (folio_test_large(folio) && !(flags & TTU_HWPOISON) &&
+			/* Each compressed member owns a distinct token/PTE reference. */
+			if (folio_test_large(folio) && !memcompress_folio_token(folio) &&
+			    !(flags & TTU_HWPOISON) &&
 			    can_batch_unmap_folio_ptes(address, folio, pvmw.pte))
 				nr_pages = folio_nr_pages(folio);
 			end_addr = address + nr_pages * PAGE_SIZE;
@@ -1859,12 +1862,13 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 			dec_mm_counter(mm, mm_counter(folio));
 		} else if (folio_test_anon(folio)) {
 			swp_entry_t entry = page_swap_entry(subpage);
+			unsigned long token = memcompress_folio_token(folio);
 			pte_t swp_pte;
 			/*
 			 * Store the swap location in the pte.
 			 * See handle_pte_fault() ...
 			 */
-			if (unlikely(folio_test_swapbacked(folio) !=
+			if (unlikely(!token && folio_test_swapbacked(folio) !=
 					folio_test_swapcache(folio))) {
 				WARN_ON_ONCE(1);
 				goto walk_abort;
@@ -1915,12 +1919,19 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 				goto discard;
 			}
 
-			if (swap_duplicate(entry) < 0) {
+			if (token)
+				entry = swp_entry(SWP_MEMCOMPRESS,
+						token + folio_page_idx(folio, subpage));
+			if (token ? !memcompress_entry_get(swp_offset(entry)) :
+				    swap_duplicate(entry) < 0) {
 				set_pte_at(mm, address, pvmw.pte, pteval);
 				goto walk_abort;
 			}
 			if (arch_unmap_one(mm, vma, address, pteval) < 0) {
-				swap_free(entry);
+				if (token)
+					memcompress_invalidate(swp_offset(entry));
+				else
+					swap_free(entry);
 				set_pte_at(mm, address, pvmw.pte, pteval);
 				goto walk_abort;
 			}
@@ -1928,7 +1939,10 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 			/* See folio_try_share_anon_rmap(): clear PTE first. */
 			if (anon_exclusive &&
 			    folio_try_share_anon_rmap_pte(folio, subpage)) {
-				swap_free(entry);
+				if (token)
+					memcompress_invalidate(swp_offset(entry));
+				else
+					swap_free(entry);
 				set_pte_at(mm, address, pvmw.pte, pteval);
 				goto walk_abort;
 			}

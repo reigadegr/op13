@@ -22,6 +22,21 @@ menuconfig SWAP
 	  used to provide more virtual memory than the actual RAM present
 	  in your computer.  If unsure say Y.
 
+config MEMCOMPRESS
+	bool "In-memory compression of anonymous pages"
+	depends on ARM64 && ARM64_4K_PAGES && SWAP
+	select CRYPTO
+	select CRYPTO_LZ4
+	select CRYPTO_ZSTD
+	select ZPOOL
+	select ZSMALLOC
+	help
+	  Store reclaimed anonymous pages in a compressed memory pool without
+	  requiring a swap device. Compressed entries are restored on a page
+	  fault; pages that cannot be admitted retain their resident backing
+	  or use the normal swap path. The pool uses the existing zsmalloc and
+	  crypto compression APIs.
+
 config ZSWAP
 	bool "Compressed cache for swap pages"
 	depends on SWAP

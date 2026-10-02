@@ -57,6 +57,7 @@
 #include <linux/khugepaged.h>
 #include <linux/rculist_nulls.h>
 #include <linux/random.h>
+#include <linux/memcompress.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -635,6 +636,8 @@ static inline bool can_reclaim_anon_pages(struct mem_cgroup *memcg,
 					  int nid,
 					  struct scan_control *sc)
 {
+	if (memcompress_available())
+		return true;
 	if (memcg == NULL) {
 		/*
 		 * For non-memcg reclaim, is there
@@ -1800,6 +1803,8 @@ retry:
 		bool activate = false;
 		bool keep = false;
 		bool should_split_to_list = false;
+		bool memcompress_reserved = false;
+		struct memcompress_reclaim_ctx *memcompress_ctx = NULL;
 
 		cond_resched();
 
@@ -1977,6 +1982,29 @@ retry:
 					goto keep_locked;
 				if (folio_maybe_dma_pinned(folio))
 					goto keep_locked;
+				if (nr_pages <= MEMCOMPRESS_MAX_FOLIO_PAGES &&
+				    (sc->gfp_mask & __GFP_FS) && sc->may_swap &&
+				    memcompress_reserve_eligible(folio)) {
+					enum memcompress_reclaim_source source =
+						current_is_kswapd() ? MEMCOMPRESS_RECLAIM_KSWAPD :
+						MEMCOMPRESS_RECLAIM_DIRECT;
+
+					if (memcompress_reclaim_ctx_precheck(nr_pages, source))
+						memcompress_ctx =
+							memcompress_reclaim_ctx_get(nr_pages,
+										   source);
+					if (memcompress_ctx)
+						memcompress_reserved =
+							memcompress_reserve(folio, NULL);
+					if (!memcompress_reserved) {
+						memcompress_reclaim_ctx_put(memcompress_ctx);
+						memcompress_ctx = NULL;
+					} else {
+						memcompress_reclaim_queue(pgdat->node_id, nr_pages);
+					}
+				}
+				if (memcompress_reserved)
+					goto backing_ready;
 				/*
 				 * Split partially mapped folios right away.
 				 * We can free the unmapped pages without IO.
@@ -2017,6 +2045,7 @@ retry:
 				goto keep_locked;
 		}
 
+backing_ready:
 		if (folio_ref_count(folio) == 1) {
 			folio_unlock(folio);
 			if (folio_put_testzero(folio))
@@ -2082,6 +2111,20 @@ retry:
 		 */
 		if (folio_maybe_dma_pinned(folio))
 			goto activate_locked;
+
+		if (memcompress_reserved) {
+			/* Complete deferred writable TLB invalidations before reading. */
+			try_to_unmap_flush();
+			if (!memcompress_store_after_unmap(folio, &memcompress_ctx))
+				goto keep_locked;
+			if (!folio_ref_freeze(folio, 1))
+				goto keep_locked;
+			memcompress_reclaim_complete(pgdat->node_id, nr_pages, true);
+			memcompress_reserved = false;
+			folio_clear_dirty(folio);
+			folio_unlock(folio);
+			goto free_it;
+		}
 
 		mapping = folio_mapping(folio);
 		if (folio_test_dirty(folio)) {
@@ -2259,6 +2302,11 @@ activate_locked:
 			count_memcg_folio_events(folio, PGACTIVATE, nr_pages);
 		}
 keep_locked:
+		if (memcompress_reserved) {
+			memcompress_rollback_folio(folio);
+			memcompress_reclaim_complete(pgdat->node_id, nr_pages, false);
+		}
+		memcompress_reclaim_ctx_put(memcompress_ctx);
 		folio_unlock(folio);
 keep:
 		list_add(&folio->lru, &ret_folios);
@@ -3469,7 +3517,7 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
 	if (!sc->may_swap)
 		return 0;
 
-	if (!can_demote(pgdat->node_id, sc) &&
+	if (!memcompress_available() && !can_demote(pgdat->node_id, sc) &&
 	    mem_cgroup_get_nr_swap_pages(memcg) < MIN_LRU_BATCH)
 		return 0;
 

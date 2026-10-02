@@ -62,6 +62,7 @@
 #include <linux/pgsize_migration.h>
 #include <linux/writeback.h>
 #include <linux/memcontrol.h>
+#include <linux/memcompress.h>
 #include <linux/mmu_notifier.h>
 #include <linux/swapops.h>
 #include <linux/elf.h>
@@ -802,7 +803,15 @@ copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 	struct page *page;
 	swp_entry_t entry = pte_to_swp_entry(orig_pte);
 
-	if (likely(!non_swap_entry(entry))) {
+	if (is_memcompress_entry(entry)) {
+		if (!memcompress_entry_get(swp_offset(entry)))
+			return -EIO;
+		if (pte_swp_exclusive(orig_pte)) {
+			pte = pte_swp_clear_exclusive(orig_pte);
+			set_pte_at(src_mm, addr, src_pte, pte);
+		}
+		rss[MM_SWAPENTS]++;
+	} else if (likely(!non_swap_entry(entry))) {
 		if (swap_duplicate(entry) < 0)
 			return -EIO;
 
@@ -1194,6 +1203,10 @@ again:
 
 	if (ret == -EIO) {
 		VM_WARN_ON_ONCE(!entry.val);
+		if (is_memcompress_entry(entry)) {
+			ret = -EFAULT;
+			goto out;
+		}
 		if (add_swap_count_continuation(entry, GFP_KERNEL) < 0) {
 			ret = -ENOMEM;
 			goto out;
@@ -1643,6 +1656,11 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
 			if (is_device_private_entry(entry))
 				folio_remove_rmap_pte(folio, page, vma);
 			folio_put(folio);
+		} else if (is_memcompress_entry(entry)) {
+			if (!should_zap_cows(details))
+				continue;
+			rss[MM_SWAPENTS]--;
+			memcompress_invalidate(swp_offset(entry));
 		} else if (!non_swap_entry(entry)) {
 			max_nr = (end - addr) / PAGE_SIZE;
 			nr = swap_pte_batch(pte, max_nr, ptent);
@@ -4141,6 +4159,145 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 
 static DECLARE_WAIT_QUEUE_HEAD(swapcache_wq);
 
+static vm_fault_t do_memcompress_page(struct vm_fault *vmf, swp_entry_t swp)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct memcompress_entry *entry;
+	struct folio *folio = NULL;
+	struct page *page;
+	unsigned int page_idx = 0;
+	vm_fault_t ret = 0;
+	rmap_t rmap_flags = RMAP_NONE;
+	bool pending = false, exclusive;
+	pte_t pte;
+	int err;
+
+	entry = memcompress_load_folio_pin(swp_offset(swp));
+	if (!entry) {
+		ret = VM_FAULT_SIGBUS;
+		goto check_error;
+	}
+
+	folio = memcompress_pending_folio(entry, &page_idx);
+	if (folio) {
+		ret = folio_lock_or_retry(folio, vmf);
+		if (ret & VM_FAULT_RETRY) {
+			folio_put(folio);
+			memcompress_load_folio_abort(entry);
+			return ret;
+		}
+		if (memcompress_pending_folio_valid(entry, folio, page_idx)) {
+			pending = true;
+		} else {
+			folio_unlock(folio);
+			folio_put(folio);
+			folio = NULL;
+		}
+	}
+
+	if (!pending) {
+		folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE | __GFP_CMA, 0,
+					vma, vmf->address, true);
+		if (!folio) {
+			ret = VM_FAULT_OOM;
+			goto abort_entry;
+		}
+		if (mem_cgroup_charge(folio, mm, GFP_KERNEL)) {
+			folio_put(folio);
+			folio = NULL;
+			ret = VM_FAULT_OOM;
+			goto abort_entry;
+		}
+		__folio_set_locked(folio);
+		__folio_set_swapbacked(folio);
+		err = memcompress_load_folio(entry, folio);
+		if (err) {
+			ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+			if (err == -EAGAIN)
+				ret = 0;
+			goto release_folio;
+		}
+		__folio_mark_uptodate(folio);
+		page_idx = 0;
+	}
+	page = folio_page(folio, page_idx);
+	if (unlikely(PageHWPoison(page))) {
+		ret = VM_FAULT_HWPOISON;
+		goto release_folio;
+	}
+
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+	if (unlikely(!vmf->pte ||
+		     !pte_same(ptep_get(vmf->pte), vmf->orig_pte)))
+		goto unlock;
+
+	/* Pending tokens can coexist with aliases that still map the old folio. */
+	exclusive = !pending;
+	if (folio_test_ksm(folio))
+		exclusive = false;
+	pte = mk_pte(page, vma->vm_page_prot);
+	if (pte_swp_soft_dirty(vmf->orig_pte))
+		pte = pte_mksoft_dirty(pte);
+	if (pte_swp_uffd_wp(vmf->orig_pte))
+		pte = pte_mkuffd_wp(pte);
+	if (exclusive) {
+		rmap_flags |= RMAP_EXCLUSIVE;
+		if ((vma->vm_flags & VM_WRITE) && !userfaultfd_pte_wp(vma, pte) &&
+		    !pte_needs_soft_dirty_wp(vma, pte)) {
+			pte = pte_mkwrite(pte, vma);
+			if (vmf->flags & FAULT_FLAG_WRITE) {
+				pte = pte_mkdirty(pte);
+				vmf->flags &= ~FAULT_FLAG_WRITE;
+			}
+		}
+	}
+
+	inc_mm_counter(mm, MM_ANONPAGES);
+	dec_mm_counter(mm, MM_SWAPENTS);
+	if (pending) {
+		folio_add_anon_rmap_ptes(folio, page, 1, vma, vmf->address,
+					rmap_flags);
+	} else {
+		folio_add_new_anon_rmap(folio, vma, vmf->address, RMAP_EXCLUSIVE);
+		folio_add_lru_vma(folio, vma);
+	}
+	flush_icache_pages(vma, page, 1);
+	vmf->orig_pte = pte;
+	set_pte_at(mm, vmf->address, vmf->pte, pte);
+	arch_do_swap_page_nr(mm, vma, vmf->address, pte, pte, 1);
+	memcompress_load_folio_commit(entry);
+	folio_unlock(folio);
+	if (vmf->flags & FAULT_FLAG_WRITE)
+		return do_wp_page(vmf);
+	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	vmf->pte = NULL;
+	return VM_FAULT_NOPAGE;
+
+unlock:
+	if (vmf->pte) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		vmf->pte = NULL;
+	}
+release_folio:
+	folio_unlock(folio);
+	folio_put(folio);
+abort_entry:
+	memcompress_load_folio_abort(entry);
+check_error:
+	if (!ret)
+		return 0;
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+	if (!vmf->pte)
+		return 0;
+	if (!pte_same(ptep_get(vmf->pte), vmf->orig_pte))
+		ret = 0;
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	vmf->pte = NULL;
+	return ret;
+}
+
 /*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
  * but allow concurrent faults), and pte mapped but not yet locked.
@@ -4172,6 +4329,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		goto out;
 
 	entry = pte_to_swp_entry(vmf->orig_pte);
+	if (is_memcompress_entry(entry))
+		return do_memcompress_page(vmf, entry);
 	if (unlikely(non_swap_entry(entry))) {
 		if (is_migration_entry(entry)) {
 			migration_entry_wait(vma->vm_mm, vmf->pmd,

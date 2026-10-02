@@ -21,6 +21,7 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/mm_inline.h>
+#include <linux/memcompress.h>
 #include <linux/string.h>
 #include <linux/uio.h>
 #include <linux/ksm.h>
@@ -724,7 +725,11 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 			swp_entry_t entry;
 
 			entry = pte_to_swp_entry(ptent);
-			if (!non_swap_entry(entry)) {
+			if (is_memcompress_entry(entry)) {
+				nr_swap--;
+				memcompress_invalidate(swp_offset(entry));
+				pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+			} else if (!non_swap_entry(entry)) {
 				max_nr = (end - addr) / PAGE_SIZE;
 				nr = swap_pte_batch(pte, max_nr, ptent);
 				nr_swap -= nr;
