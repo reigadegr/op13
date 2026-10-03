@@ -2874,6 +2874,14 @@ static int early_mod_check(struct load_info *info, int flags)
 	return err;
 }
 
+static const char *kernel_module_blacklist[] = {
+    "bluetooth",
+    "hidp",
+    "rfcomm",
+    "rfkill",
+    NULL
+};
+
 /*
  * Allocate and load the module: note that size of section 0 is always
  * zero, and we rely on this for optional sections.
@@ -2884,6 +2892,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	struct module *mod;
 	bool module_allocated = false;
 	long err = 0;
+    int i = 0;
 	char *after_dashes;
 
 	/*
@@ -2914,6 +2923,13 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	err = early_mod_check(info, flags);
 	if (err)
 		goto free_copy;
+
+    for (i = 0; kernel_module_blacklist[i] != NULL; i++) {
+        if (strcmp(info->name, kernel_module_blacklist[i]) == 0) {
+            pr_warn("Module %s is blacklisted\n", info->name);
+            goto free_copy;
+        }
+    }
 
 	/* Figure out module layout, and allocate all the memory. */
 	mod = layout_and_allocate(info, flags);
