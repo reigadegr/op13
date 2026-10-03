@@ -36,6 +36,8 @@
 #include <asm/mte.h>
 
 #define MC_MAX_CONTEXTS 32U
+#define MC_ENTRY_LOCK_BITS 10
+#define MC_ENTRY_LOCK_COUNT BIT(MC_ENTRY_LOCK_BITS)
 
 enum memcompress_state {
 	MC_PENDING,
@@ -47,7 +49,6 @@ struct memcompress_entry {
 	struct rcu_head rcu;
 	struct kref refcount;
 	atomic_t pte_refs;
-	struct mutex lock;
 	struct folio *folio;
 	struct obj_cgroup *objcg;
 	unsigned long handle;
@@ -57,8 +58,8 @@ struct memcompress_entry {
 	u8 nr_pages;
 	u8 page_idx;
 	u8 state;
-	bool folio_owner;
-	bool refresh_pending;
+	bool folio_owner : 1;
+	bool refresh_pending : 1;
 };
 
 struct memcompress_reclaim_ctx {
@@ -88,6 +89,7 @@ struct memcompress_reclaim_node {
 
 static DEFINE_XARRAY_ALLOC(memcompress_entries);
 static DEFINE_MUTEX(memcompress_token_lock);
+static struct mutex memcompress_entry_locks[MC_ENTRY_LOCK_COUNT];
 static DEFINE_SPINLOCK(memcompress_context_lock);
 static DECLARE_WAIT_QUEUE_HEAD(memcompress_context_wait);
 static DEFINE_PER_CPU(struct memcompress_decomp_ctx, memcompress_decomp_ctxs);
@@ -161,6 +163,14 @@ static void memcompress_auto_enable_work(struct work_struct *work)
 
 static DECLARE_DELAYED_WORK(memcompress_auto_enable_worker,
 			    memcompress_auto_enable_work);
+
+/* Callers hold one shard at a time and pin entries independently with krefs. */
+static struct mutex *memcompress_entry_lock(struct memcompress_entry *entry)
+{
+	u32 hash = (entry->token * 0x61c88647U) >> (32 - MC_ENTRY_LOCK_BITS);
+
+	return &memcompress_entry_locks[hash];
+}
 
 static int memcompress_entry_charge(struct memcompress_entry *entry, size_t size)
 {
@@ -373,10 +383,10 @@ bool memcompress_entry_set_refresh_pending(unsigned long token)
 
 	if (!entry)
 		return false;
-	mutex_lock(&entry->lock);
+	mutex_lock(memcompress_entry_lock(entry));
 	old = entry->refresh_pending;
 	entry->refresh_pending = true;
-	mutex_unlock(&entry->lock);
+	mutex_unlock(memcompress_entry_lock(entry));
 	memcompress_entry_put(entry);
 	return !old;
 }
@@ -387,9 +397,9 @@ void memcompress_entry_clear_refresh_pending(unsigned long token)
 
 	if (!entry)
 		return;
-	mutex_lock(&entry->lock);
+	mutex_lock(memcompress_entry_lock(entry));
 	entry->refresh_pending = false;
-	mutex_unlock(&entry->lock);
+	mutex_unlock(memcompress_entry_lock(entry));
 	memcompress_entry_put(entry);
 }
 
@@ -684,7 +694,6 @@ static struct memcompress_entry *memcompress_entry_alloc(struct folio *folio)
 				 GFP_NOWAIT | __GFP_NOWARN);
 	if (!entry)
 		return NULL;
-	mutex_init(&entry->lock);
 	kref_init(&entry->refcount);
 	atomic_set(&entry->pte_refs, 0);
 	entry->objcg = get_obj_cgroup_from_folio(folio);
@@ -793,10 +802,10 @@ bool memcompress_reserve(struct folio *folio, bool *stored)
 
 			if (!entry)
 				return false;
-			mutex_lock(&entry->lock);
+			mutex_lock(memcompress_entry_lock(entry));
 			matches = entry->folio == folio && entry->folio_owner &&
 				entry->nr_pages == nr_pages && entry->page_idx == i;
-			mutex_unlock(&entry->lock);
+			mutex_unlock(memcompress_entry_lock(entry));
 			memcompress_entry_put(entry);
 			if (!matches)
 				return false;
@@ -949,11 +958,11 @@ bool memcompress_store_after_unmap(struct folio *folio,
 		entries[i] = entry;
 		if (!entry)
 			goto free_payload;
-		mutex_lock(&entry->lock);
+		mutex_lock(memcompress_entry_lock(entry));
 		matches = entry->folio == folio && entry->folio_owner &&
 			entry->state == MC_PENDING && entry->nr_pages == nr_pages &&
 			entry->page_idx == i;
-		mutex_unlock(&entry->lock);
+		mutex_unlock(memcompress_entry_lock(entry));
 		if (!matches)
 			goto free_payload;
 	}
@@ -983,7 +992,7 @@ bool memcompress_store_after_unmap(struct folio *folio,
 	for (i = 0; i < nr_pages; i++) {
 		struct memcompress_entry *entry = entries[i];
 
-		mutex_lock(&entry->lock);
+		mutex_lock(memcompress_entry_lock(entry));
 		entry->handle = payload[i].handle;
 		entry->length = payload[i].length;
 		entry->state = payload[i].length ? MC_STORED : MC_SAMEFILL;
@@ -992,7 +1001,7 @@ bool memcompress_store_after_unmap(struct folio *folio,
 		atomic_long_add(entry->length, &memcompress_compressed_bytes);
 		if (!entry->length)
 			atomic_long_inc(&memcompress_same_filled_pages);
-		mutex_unlock(&entry->lock);
+		mutex_unlock(memcompress_entry_lock(entry));
 		folio_put(folio);
 		memcompress_entry_put(entry);
 	}
@@ -1033,13 +1042,13 @@ void memcompress_rollback_folio(struct folio *folio)
 
 		if (!entry)
 			continue;
-		mutex_lock(&entry->lock);
+		mutex_lock(memcompress_entry_lock(entry));
 		if (entry->folio == folio && entry->folio_owner &&
 		    entry->nr_pages == nr_pages && entry->page_idx == i) {
 			entry->folio_owner = false;
 			drop_owner = true;
 		}
-		mutex_unlock(&entry->lock);
+		mutex_unlock(memcompress_entry_lock(entry));
 		/* Pending PTEs retain the physical folio reference until restored. */
 		if (drop_owner)
 			memcompress_entry_put(entry);
@@ -1075,14 +1084,14 @@ struct folio *memcompress_pending_folio(struct memcompress_entry *entry,
 {
 	struct folio *folio = NULL;
 
-	mutex_lock(&entry->lock);
+	mutex_lock(memcompress_entry_lock(entry));
 	if (entry->state == MC_PENDING && entry->folio) {
 		folio = entry->folio;
 		folio_get(folio);
 		if (page_idx)
 			*page_idx = entry->page_idx;
 	}
-	mutex_unlock(&entry->lock);
+	mutex_unlock(memcompress_entry_lock(entry));
 	return folio;
 }
 
@@ -1092,10 +1101,10 @@ bool memcompress_pending_folio_valid(struct memcompress_entry *entry,
 {
 	bool valid;
 
-	mutex_lock(&entry->lock);
+	mutex_lock(memcompress_entry_lock(entry));
 	valid = entry->state == MC_PENDING && entry->folio == folio &&
 		entry->page_idx == page_idx;
-	mutex_unlock(&entry->lock);
+	mutex_unlock(memcompress_entry_lock(entry));
 	return valid;
 }
 
@@ -1108,7 +1117,7 @@ int memcompress_do_load_entry(struct memcompress_entry *entry, void *dst)
 
 	if (!entry || !dst)
 		return -EINVAL;
-	mutex_lock(&entry->lock);
+	mutex_lock(memcompress_entry_lock(entry));
 	if (entry->refresh_pending || entry->state == MC_PENDING) {
 		ret = -EAGAIN;
 		goto unlock;
@@ -1140,7 +1149,7 @@ int memcompress_do_load_entry(struct memcompress_entry *entry, void *dst)
 		zpool_unmap_handle(memcompress_pool, entry->handle);
 	local_unlock(&memcompress_decomp_ctxs.lock);
 unlock:
-	mutex_unlock(&entry->lock);
+	mutex_unlock(memcompress_entry_lock(entry));
 	return ret;
 }
 
@@ -1188,14 +1197,14 @@ int memcompress_migrate_folio(struct folio *dst, struct folio *src)
 
 		if (!entry)
 			goto rollback;
-		mutex_lock(&entry->lock);
+		mutex_lock(memcompress_entry_lock(entry));
 		matches = entry->folio == src && entry->nr_pages == nr_pages &&
 			entry->page_idx == i;
 		if (matches) {
 			folio_get(dst);
 			entry->folio = dst;
 		}
-		mutex_unlock(&entry->lock);
+		mutex_unlock(memcompress_entry_lock(entry));
 		memcompress_entry_put(entry);
 		if (!matches)
 			goto rollback;
@@ -1223,13 +1232,13 @@ void memcompress_migrate_folio_rollback(struct folio *dst, struct folio *src)
 
 		if (!entry)
 			continue;
-		mutex_lock(&entry->lock);
+		mutex_lock(memcompress_entry_lock(entry));
 		if (entry->folio == dst) {
 			folio_get(src);
 			entry->folio = src;
 			moved = true;
 		}
-		mutex_unlock(&entry->lock);
+		mutex_unlock(memcompress_entry_lock(entry));
 		memcompress_entry_put(entry);
 		if (moved)
 			folio_put(dst);
@@ -1412,6 +1421,8 @@ static int __init memcompress_init(void)
 	unsigned int i, reserved;
 	int cpu, nid, ret;
 
+	for (i = 0; i < MC_ENTRY_LOCK_COUNT; i++)
+		mutex_init(&memcompress_entry_locks[i]);
 	memcompress_choose_compressor();
 	memcompress_entry_cache = KMEM_CACHE(memcompress_entry, 0);
 	if (!memcompress_entry_cache)
