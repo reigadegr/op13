@@ -4198,7 +4198,7 @@ static vm_fault_t do_memcompress_page(struct vm_fault *vmf, swp_entry_t swp)
 
 	if (!pending) {
 		folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE | __GFP_CMA, 0,
-					vma, vmf->address, true);
+					vma, vmf->address, false);
 		if (!folio) {
 			ret = VM_FAULT_OOM;
 			goto abort_entry;
