@@ -1016,6 +1016,8 @@ void memcompress_rollback_folio(struct folio *folio)
 	if (!base || !folio_test_locked(folio) ||
 	    nr_pages > MEMCOMPRESS_MAX_FOLIO_PAGES)
 		return;
+	/* Restore mappings while the reservation still owns all member entries. */
+	memcompress_restore_ptes(folio);
 	for (i = 0; i < nr_pages; i++) {
 		struct memcompress_entry *entry = memcompress_get_entry(base + i);
 		bool drop_owner = false;

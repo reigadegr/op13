@@ -2033,6 +2033,10 @@ void try_to_unmap(struct folio *folio, enum ttu_flags flags)
 		.anon_lock = folio_lock_anon_vma_read,
 	};
 
+	/* Rollback must find every token after exec's unlocked stack moves. */
+	if (memcompress_folio_token(folio))
+		rwc.invalid_vma = invalid_migration_vma;
+
 	if (flags & TTU_RMAP_LOCKED)
 		rmap_walk_locked(folio, &rwc);
 	else
@@ -2793,6 +2797,62 @@ void rmap_walk_locked(struct folio *folio, struct rmap_walk_control *rwc)
 	else
 		rmap_walk_file(folio, rwc, true);
 }
+
+#ifdef CONFIG_MEMCOMPRESS
+static bool memcompress_restore_pte(struct folio *folio,
+		struct vm_area_struct *vma, unsigned long addr, void *arg)
+{
+	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, addr,
+			      PVMW_SYNC | PVMW_MEMCOMPRESS);
+	unsigned long base = memcompress_folio_token(folio);
+	struct mm_struct *mm = vma->vm_mm;
+
+	while (page_vma_mapped_walk(&pvmw)) {
+		pte_t old_pte = ptep_get(pvmw.pte);
+		swp_entry_t entry = pte_to_swp_entry(old_pte);
+		struct page *page = folio_page(folio, swp_offset(entry) - base);
+		pte_t pte = pte_mkold(pte_wrprotect(
+				mk_pte(page, READ_ONCE(vma->vm_page_prot))));
+
+		if (pte_swp_soft_dirty(old_pte))
+			pte = pte_mksoft_dirty(pte);
+		if (pte_swp_uffd_wp(old_pte))
+			pte = pte_mkuffd_wp(pte);
+
+		/* Fork can share a token; restore every alias read-only for COW. */
+		folio_get(folio);
+		folio_add_anon_rmap_pte(folio, page, vma, pvmw.address, RMAP_NONE);
+		inc_mm_counter(mm, MM_ANONPAGES);
+		dec_mm_counter(mm, MM_SWAPENTS);
+		set_pte_at(mm, pvmw.address, pvmw.pte, pte);
+		memcompress_invalidate(swp_offset(entry));
+		if (vma->vm_flags & VM_LOCKED)
+			mlock_drain_local();
+		update_mmu_cache(vma, pvmw.address, pvmw.pte);
+	}
+	return true;
+}
+
+/*
+ * The caller holds the folio lock, its reservation references and an anon_vma
+ * reference acquired before unmapping. Restore PTEs before dropping any of
+ * these references so rejected compression cannot strand an unmapped folio.
+ */
+void memcompress_restore_ptes(struct folio *folio)
+{
+	struct rmap_walk_control rwc = {
+		.rmap_one = memcompress_restore_pte,
+	};
+
+	if (WARN_ON_ONCE(!folio_test_locked(folio)))
+		return;
+	if (!memcompress_folio_token(folio))
+		return;
+	/* A failed partial unmap may still have writable TLB entries queued. */
+	try_to_unmap_flush();
+	rmap_walk(folio, &rwc);
+}
+#endif
 
 #ifdef CONFIG_HUGETLB_PAGE
 /*

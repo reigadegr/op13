@@ -1805,6 +1805,7 @@ retry:
 		bool should_split_to_list = false;
 		bool memcompress_reserved = false;
 		struct memcompress_reclaim_ctx *memcompress_ctx = NULL;
+		struct anon_vma *memcompress_anon_vma = NULL;
 
 		cond_resched();
 
@@ -1993,7 +1994,10 @@ retry:
 						memcompress_ctx =
 							memcompress_reclaim_ctx_get(nr_pages,
 										   source);
+					/* Rollback needs the rmap even after the last unmap. */
 					if (memcompress_ctx)
+						memcompress_anon_vma = folio_get_anon_vma(folio);
+					if (memcompress_anon_vma)
 						memcompress_reserved =
 							memcompress_reserve(folio, NULL);
 					if (!memcompress_reserved) {
@@ -2002,6 +2006,10 @@ retry:
 					} else {
 						memcompress_reclaim_queue(pgdat->node_id, nr_pages);
 					}
+				}
+				if (!memcompress_reserved && memcompress_anon_vma) {
+					put_anon_vma(memcompress_anon_vma);
+					memcompress_anon_vma = NULL;
 				}
 				if (memcompress_reserved)
 					goto backing_ready;
@@ -2121,6 +2129,8 @@ backing_ready:
 				goto keep_locked;
 			memcompress_reclaim_complete(pgdat->node_id, nr_pages, true);
 			memcompress_reserved = false;
+			put_anon_vma(memcompress_anon_vma);
+			memcompress_anon_vma = NULL;
 			folio_clear_dirty(folio);
 			folio_unlock(folio);
 			goto free_it;
@@ -2306,6 +2316,8 @@ keep_locked:
 			memcompress_rollback_folio(folio);
 			memcompress_reclaim_complete(pgdat->node_id, nr_pages, false);
 		}
+		if (memcompress_anon_vma)
+			put_anon_vma(memcompress_anon_vma);
 		memcompress_reclaim_ctx_put(memcompress_ctx);
 		folio_unlock(folio);
 keep:

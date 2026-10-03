@@ -43,11 +43,14 @@ bool is_memcompress_shadow(void *shadow);
 unsigned long memcompress_shadow_token(void *shadow);
 bool memcompress_reserve_eligible(struct folio *folio);
 bool memcompress_fresh_reservation(struct folio *folio);
+/* Pin the folio's anon_vma before reserve until store/rollback completes. */
 bool memcompress_reserve(struct folio *folio, bool *stored);
 bool memcompress_store_cache(struct folio *folio, unsigned long *token);
 bool memcompress_store_after_unmap(struct folio *folio,
 				  struct memcompress_reclaim_ctx **ctxp);
 void memcompress_rollback_folio(struct folio *folio);
+/* Requires the locked reservation folio and the caller's anon_vma pin. */
+void memcompress_restore_ptes(struct folio *folio);
 void memcompress_invalidate_folio(struct folio *folio);
 
 bool memcompress_reclaim_ctx_precheck(unsigned int nr_pages,
@@ -115,6 +118,7 @@ static inline bool memcompress_store_after_unmap(struct folio *folio,
 	return false;
 }
 static inline void memcompress_rollback_folio(struct folio *folio) { }
+static inline void memcompress_restore_ptes(struct folio *folio) { }
 static inline void memcompress_invalidate_folio(struct folio *folio) { }
 static inline bool memcompress_reclaim_ctx_precheck(unsigned int nr_pages,
 				 enum memcompress_reclaim_source source)

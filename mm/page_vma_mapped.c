@@ -4,6 +4,7 @@
 #include <linux/hugetlb.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
+#include <linux/memcompress.h>
 
 #include "internal.h"
 
@@ -39,7 +40,7 @@ static bool map_pte(struct page_vma_mapped_walk *pvmw, spinlock_t **ptlp)
 
 	ptent = ptep_get(pvmw->pte);
 
-	if (pvmw->flags & PVMW_MIGRATION) {
+	if (pvmw->flags & (PVMW_MIGRATION | PVMW_MEMCOMPRESS)) {
 		if (!is_swap_pte(ptent))
 			return false;
 	} else if (is_swap_pte(ptent)) {
@@ -98,6 +99,19 @@ static bool check_pte(struct page_vma_mapped_walk *pvmw, unsigned long pte_nr)
 {
 	unsigned long pfn;
 	pte_t ptent = ptep_get(pvmw->pte);
+
+	if (IS_ENABLED(CONFIG_MEMCOMPRESS) &&
+	    (pvmw->flags & PVMW_MEMCOMPRESS)) {
+		struct folio *folio = page_folio(pfn_to_page(pvmw->pfn));
+		unsigned long base = memcompress_folio_token(folio);
+		swp_entry_t entry;
+
+		if (!base || !is_swap_pte(ptent))
+			return false;
+		entry = pte_to_swp_entry(ptent);
+		return is_memcompress_entry(entry) && swp_offset(entry) >= base &&
+			swp_offset(entry) - base < pvmw->nr_pages;
+	}
 
 	if (pvmw->flags & PVMW_MIGRATION) {
 		swp_entry_t entry;
@@ -257,7 +271,7 @@ restart:
 				return true;
 			}
 			if (likely(pmd_trans_huge(pmde) || pmd_devmap(pmde))) {
-				if (pvmw->flags & PVMW_MIGRATION)
+				if (pvmw->flags & (PVMW_MIGRATION | PVMW_MEMCOMPRESS))
 					return not_found(pvmw);
 				if (!check_pmd(pmd_pfn(pmde), pvmw))
 					return not_found(pvmw);
