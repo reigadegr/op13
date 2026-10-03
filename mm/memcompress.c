@@ -24,6 +24,7 @@
 #include <linux/mutex.h>
 #include <linux/pagemap.h>
 #include <linux/percpu.h>
+#include <linux/sched/signal.h>
 #include <linux/slab.h>
 #include <linux/sysfs.h>
 #include <linux/topology.h>
@@ -1256,14 +1257,19 @@ void memcompress_reclaim_queue(int nid, unsigned int nr_pages)
 void memcompress_reclaim_complete(int nid, unsigned int nr_pages, bool success)
 {
 	struct memcompress_reclaim_node *node;
+	long remaining;
 
 	if (nid < 0 || nid >= MAX_NUMNODES)
 		return;
 	node = &memcompress_nodes[nid];
 	if (success)
 		atomic64_add(nr_pages, &node->success);
-	atomic_long_sub(nr_pages, &node->inflight);
-	wake_up_all(&node->wait);
+	remaining = atomic_long_sub_return(nr_pages, &node->inflight);
+	WARN_ON_ONCE(remaining < 0);
+	if (remaining <= 0)
+		wake_up_all(&node->wait);
+	else if (success)
+		wake_up(&node->wait);
 }
 
 bool memcompress_reclaim_inflight(int nid)
@@ -1280,17 +1286,12 @@ u64 memcompress_reclaim_progress(int nid)
 
 long memcompress_wait_reclaim_progress(int nid, u64 cursor, long timeout)
 {
-	long ret;
-
 	if (nid < 0 || nid >= MAX_NUMNODES || timeout < 1)
 		return 0;
-	if (!memcompress_reclaim_inflight(nid) ||
-	    memcompress_reclaim_progress(nid) != cursor)
-		return timeout;
-	ret = wait_event_interruptible_timeout(memcompress_nodes[nid].wait,
+	return wait_event_idle_exclusive_timeout(memcompress_nodes[nid].wait,
 		memcompress_reclaim_progress(nid) != cursor ||
-		!memcompress_reclaim_inflight(nid), timeout);
-	return ret > 0 ? ret : 1;
+		!memcompress_reclaim_inflight(nid) ||
+		fatal_signal_pending(current), timeout);
 }
 
 static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr,
