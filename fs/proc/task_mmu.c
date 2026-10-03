@@ -12,6 +12,7 @@
 #include <linux/pagemap.h>
 #include <linux/pgsize_migration.h>
 #include <linux/mempolicy.h>
+#include <linux/memcompress.h>
 #include <linux/rmap.h>
 #include <linux/swap.h>
 #include <linux/sched/mm.h>
@@ -552,7 +553,19 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 	} else if (is_swap_pte(ptent)) {
 		swp_entry_t swpent = pte_to_swp_entry(ptent);
 
-		if (!non_swap_entry(swpent)) {
+		if (is_memcompress_entry(swpent)) {
+			u64 pss_delta = (u64)PAGE_SIZE << PSS_SHIFT;
+			int mapcount;
+
+			/* Synthetic tokens have no swap_info_struct or swap_map. */
+			if (!memcompress_entry_stat(swp_offset(swpent), NULL,
+						   &mapcount))
+				return;
+			mss->swap += PAGE_SIZE;
+			if (mapcount > 1)
+				do_div(pss_delta, mapcount);
+			mss->swap_pss += pss_delta;
+		} else if (!non_swap_entry(swpent)) {
 			int mapcount;
 
 			mss->swap += PAGE_SIZE;

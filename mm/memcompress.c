@@ -46,6 +46,7 @@ enum memcompress_state {
 struct memcompress_entry {
 	struct rcu_head rcu;
 	struct kref refcount;
+	atomic_t pte_refs;
 	struct mutex lock;
 	struct folio *folio;
 	struct obj_cgroup *objcg;
@@ -248,7 +249,12 @@ struct memcompress_entry *memcompress_get_entry(unsigned long token)
 
 bool memcompress_entry_get(unsigned long token)
 {
-	return memcompress_get_entry(token) != NULL;
+	struct memcompress_entry *entry = memcompress_get_entry(token);
+
+	if (!entry)
+		return false;
+	atomic_inc(&entry->pte_refs);
+	return true;
 }
 
 bool memcompress_entry_present(unsigned long token)
@@ -275,6 +281,7 @@ static void memcompress_entry_release(struct kref *ref)
 	struct memcompress_entry *entry;
 
 	entry = container_of(ref, struct memcompress_entry, refcount);
+	WARN_ON_ONCE(atomic_read(&entry->pte_refs));
 	if (entry->state == MC_STORED)
 		zpool_free(memcompress_pool, entry->handle);
 	if (entry->state == MC_SAMEFILL)
@@ -302,6 +309,7 @@ void memcompress_invalidate(unsigned long token)
 	struct memcompress_entry *entry = memcompress_get_entry(token);
 
 	if (entry) {
+		WARN_ON_ONCE(atomic_dec_return(&entry->pte_refs) < 0);
 		memcompress_entry_put(entry);
 		memcompress_entry_put(entry);
 	}
@@ -342,7 +350,6 @@ bool memcompress_entry_stat(unsigned long token, unsigned long *compressed,
 			   int *mapcount)
 {
 	struct memcompress_entry *entry;
-	int refs;
 
 	if (compressed)
 		*compressed = 0;
@@ -351,11 +358,10 @@ bool memcompress_entry_stat(unsigned long token, unsigned long *compressed,
 	entry = memcompress_get_entry(token);
 	if (!entry)
 		return false;
-	refs = refcount_read(&entry->refcount.refcount);
 	if (compressed)
 		*compressed = READ_ONCE(entry->length);
 	if (mapcount)
-		*mapcount = max(refs - 1 - READ_ONCE(entry->folio_owner), 1);
+		*mapcount = atomic_read(&entry->pte_refs);
 	memcompress_entry_put(entry);
 	return true;
 }
@@ -680,6 +686,7 @@ static struct memcompress_entry *memcompress_entry_alloc(struct folio *folio)
 		return NULL;
 	mutex_init(&entry->lock);
 	kref_init(&entry->refcount);
+	atomic_set(&entry->pte_refs, 0);
 	entry->objcg = get_obj_cgroup_from_folio(folio);
 #ifdef CONFIG_MEMCG
 	if (!entry->objcg && !mem_cgroup_disabled()) {
@@ -901,6 +908,8 @@ bool memcompress_store_cache(struct folio *folio, unsigned long *token)
 		goto out;
 	}
 	folio->private = 0;
+	/* The returned reference is transferred to the caller's future PTE. */
+	atomic_set(&entry->pte_refs, 1);
 	*token = id;
 	ret = true;
 	goto out;
@@ -1051,6 +1060,7 @@ struct memcompress_entry *memcompress_load_folio_pin(unsigned long token)
 
 void memcompress_load_folio_commit(struct memcompress_entry *entry)
 {
+	WARN_ON_ONCE(atomic_dec_return(&entry->pte_refs) < 0);
 	memcompress_entry_put(entry);
 	memcompress_entry_put(entry);
 }
