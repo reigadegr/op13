@@ -3449,8 +3449,8 @@ out:
 static bool can_age_anon_pages(struct pglist_data *pgdat,
 			       struct scan_control *sc)
 {
-	/* Aging the anon LRU is valuable if swap is present: */
-	if (total_swap_pages > 0)
+	/* Compressed backing also needs cold pages from the active anon LRU. */
+	if (memcompress_available() || total_swap_pages > 0)
 		return true;
 
 	/* Also valuable if anon pages can be demoted: */
