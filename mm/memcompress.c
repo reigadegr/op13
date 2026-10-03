@@ -1422,8 +1422,8 @@ static void __init memcompress_choose_compressor(void)
 static int __init memcompress_init(void)
 {
 	struct kobject *kobj;
-	unsigned int i, reserved;
-	int cpu, nid, ret;
+	unsigned int i, reserved, wanted;
+	int cpu, nid, ret = -ENOMEM;
 
 	for (i = 0; i < MC_ENTRY_LOCK_COUNT; i++)
 		mutex_init(&memcompress_entry_locks[i]);
@@ -1442,23 +1442,31 @@ static int __init memcompress_init(void)
 		ret = -EINVAL;
 		goto destroy_pool;
 	}
-	memcompress_nr_contexts = min(num_possible_cpus() * 4U, MC_MAX_CONTEXTS);
-	for (i = 0; i < memcompress_nr_contexts; i++) {
+	wanted = min(num_possible_cpus() * 4U, MC_MAX_CONTEXTS);
+	for (i = 0; i < wanted; i++) {
 		struct memcompress_reclaim_ctx *ctx = &memcompress_contexts[i];
 
 		ctx->tfm = crypto_alloc_comp(memcompress_compressor, 0, 0);
 		if (IS_ERR(ctx->tfm)) {
 			ret = PTR_ERR(ctx->tfm);
 			ctx->tfm = NULL;
-			goto free_contexts;
+			break;
 		}
 		ctx->dst = kmalloc(PAGE_SIZE * 2, GFP_KERNEL);
 		if (!ctx->dst) {
 			ret = -ENOMEM;
-			goto free_contexts;
+			crypto_free_comp(ctx->tfm);
+			ctx->tfm = NULL;
+			break;
 		}
 		ctx->shadow_seq = 0x1bbcdc80U + i * 0x9e3779b9U;
 	}
+	memcompress_nr_contexts = i;
+	if (!memcompress_nr_contexts)
+		goto free_contexts;
+	if (memcompress_nr_contexts < wanted)
+		pr_warn("prepared only %u of %u compression contexts: %d\n",
+			memcompress_nr_contexts, wanted, ret);
 	for_each_possible_cpu(cpu) {
 		struct memcompress_decomp_ctx *ctx;
 
@@ -1477,7 +1485,7 @@ static int __init memcompress_init(void)
 	memcompress_context_free = memcompress_context_all;
 	reserved = min(num_possible_cpus(), memcompress_nr_contexts / 2);
 	memcompress_context_foreground = memcompress_context_all &
-		~GENMASK(reserved - 1, 0);
+		~(reserved ? GENMASK(reserved - 1, 0) : 0UL);
 	memcompress_borrow_limit = reserved > 1;
 	kobj = kobject_create_and_add("memcompress", mm_kobj);
 	if (!kobj) {
