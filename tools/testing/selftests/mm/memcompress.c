@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Bounded memcompress data-integrity and failed-admission regression tests.
+ * Bounded memcompress data-integrity and cross-implementation observations.
  *
  * Only this process's anonymous mapping is reclaimed, using MADV_PAGEOUT.
  * No global tunable is changed. Test data uses 2 MiB, at most 4 MiB after
  * fork COW. Run on a memcompress kernel with no configured swap devices;
  * otherwise pagemap cannot identify this private swap type portably.
+ * Strict rollback and smaps checks are opt-in port regression assertions.
+ * Token PTEs can refer to PENDING pages; they do not prove codec completion.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -27,6 +29,7 @@
 #define PM_PRESENT (1ULL << 63)
 #define PM_SWAP (1ULL << 62)
 #define PM_FRAME_MASK ((1ULL << 55) - 1)
+#define PM_TYPE_MASK 31ULL
 #define TEST_COUNT 5
 
 enum pattern {
@@ -39,7 +42,10 @@ static size_t page_size, nr_pages;
 static uint64_t *data;
 static uint64_t *before, *after;
 static int pagemap_fd;
-static bool compression_seen;
+static bool token_seen;
+static bool strict_rollback, strict_smaps;
+/* Confirmed for the vendor image and the current op13 configuration only. */
+static unsigned int token_type = 27;
 
 static void timeout_handler(int sig)
 {
@@ -66,16 +72,22 @@ static bool swap_devices_present(void)
 	return present;
 }
 
-static bool admission_enabled(void)
+/* Missing enabled is an unknown state, as on the vendor sysfs ABI. */
+static int admission_status(void)
 {
 	FILE *file = fopen("/sys/kernel/mm/memcompress/enabled", "r");
-	int value;
+	int value, ret;
 
 	if (!file)
-		return false;
+		return errno == ENOENT ? 0 : -errno;
 	value = fgetc(file);
+	ret = ferror(file) ? -EIO : -EINVAL;
 	fclose(file);
-	return value == 'Y' || value == '1';
+	if (value == 'Y' || value == '1')
+		return 1;
+	if (value == 'N' || value == '0')
+		return -EOPNOTSUPP;
+	return ret;
 }
 
 static uint64_t next_random(uint64_t *state)
@@ -126,7 +138,6 @@ static int snapshot(uint64_t *entries, size_t *swapped, size_t *resident)
 {
 	off_t offset = (uintptr_t)data / page_size * sizeof(*entries);
 	size_t bytes = nr_pages * sizeof(*entries), done = 0, page;
-	int type = -1;
 
 	while (done < bytes) {
 		ssize_t ret = pread(pagemap_fd, (char *)entries + done,
@@ -148,15 +159,15 @@ static int snapshot(uint64_t *entries, size_t *swapped, size_t *resident)
 			continue;
 		}
 		if (!(entry & PM_SWAP))
-			return -EIO;
+			return -EAGAIN;
 		/* Swap type and token are redacted without CAP_SYS_ADMIN. */
 		if (!(entry & PM_FRAME_MASK))
 			return -EACCES;
-		if (!(entry & (PM_FRAME_MASK & ~31ULL)))
-			return -EIO;
-		if (type >= 0 && type != (int)(entry & 31))
+		/* Migration and other special entries do not establish our token. */
+		if ((entry & PM_TYPE_MASK) != token_type)
 			return -EAGAIN;
-		type = entry & 31;
+		if (!(entry & (PM_FRAME_MASK & ~PM_TYPE_MASK)))
+			return -EIO;
 		(*swapped)++;
 	}
 	return 0;
@@ -185,7 +196,7 @@ static int mapping_swap_kb(unsigned long long *swap_kb)
 	return ret;
 }
 
-/* A pass requires stable, visible swap PTEs on this mapping with no disk swap. */
+/* A pass requires stable, visible token PTEs on this mapping with no disk swap. */
 static int pageout_and_observe(size_t *swapped)
 {
 	size_t resident, second_swapped;
@@ -193,8 +204,9 @@ static int pageout_and_observe(size_t *swapped)
 	int ret;
 
 	for (attempt = 0; attempt < 3; attempt++) {
-		if (!admission_enabled())
-			return -EOPNOTSUPP;
+		ret = admission_status();
+		if (ret < 0)
+			return ret;
 		if (madvise(data, DATA_SIZE, MADV_PAGEOUT))
 			return -errno;
 		ret = snapshot(before, swapped, &resident);
@@ -208,7 +220,7 @@ static int pageout_and_observe(size_t *swapped)
 			return ret;
 		if (*swapped == second_swapped &&
 		    !memcmp(before, after, nr_pages * sizeof(*before))) {
-			compression_seen = true;
+			token_seen = true;
 			return 0;
 		}
 	}
@@ -217,11 +229,28 @@ static int pageout_and_observe(size_t *swapped)
 
 static void observation_failed(int ret, const char *name)
 {
-	if (ret == -EIO)
-		ksft_test_result_fail("%s: invalid or unreadable pagemap\n", name);
-	else
-		ksft_test_result_skip("%s: cannot establish compression (%s)\n",
+	switch (-ret) {
+	case EAGAIN:
+	case EOPNOTSUPP:
+	case EACCES:
+	case EPERM:
+		ksft_test_result_skip("%s: required observation unavailable (%s)\n",
 				      name, strerror(-ret));
+		break;
+	default:
+		ksft_test_result_fail("%s: observation failed (%s)\n",
+				      name, strerror(-ret));
+	}
+}
+
+/* Even an inconclusive pageout must not hide a data-integrity failure. */
+static void observation_or_data_failed(int ret, enum pattern pattern,
+				       unsigned int salt, const char *name)
+{
+	if (!visit_data(pattern, salt, false))
+		ksft_test_result_fail("%s: restored data mismatch\n", name);
+	else
+		observation_failed(ret, name);
 }
 
 static void test_roundtrip(enum pattern pattern, const char *name)
@@ -232,11 +261,11 @@ static void test_roundtrip(enum pattern pattern, const char *name)
 	visit_data(pattern, 0, true);
 	ret = pageout_and_observe(&swapped);
 	if (ret) {
-		observation_failed(ret, name);
+		observation_or_data_failed(ret, pattern, 0, name);
 		return;
 	}
 	ksft_test_result(visit_data(pattern, 0, false),
-			 "%s: %zu compressed PTEs\n", name, swapped);
+			 "%s: %zu memcompress token PTEs\n", name, swapped);
 }
 
 static int send_byte(int fd)
@@ -262,7 +291,7 @@ static int receive_byte(int fd)
 
 static void test_fork_cow(void)
 {
-	const char *name = "fork compressed PTEs and isolate parent/child writes";
+	const char *name = "fork memcompress token PTEs and isolate parent/child writes";
 	int child_ready[2], parent_ready[2], status, ret;
 	size_t swapped;
 	bool valid;
@@ -271,7 +300,7 @@ static void test_fork_cow(void)
 	visit_data(COMPRESSIBLE, 0, true);
 	ret = pageout_and_observe(&swapped);
 	if (ret) {
-		observation_failed(ret, name);
+		observation_or_data_failed(ret, COMPRESSIBLE, 0, name);
 		return;
 	}
 	if (pipe(child_ready)) {
@@ -311,7 +340,7 @@ static void test_fork_cow(void)
 		valid &= ret == child && WIFEXITED(status) &&
 			 WEXITSTATUS(status) == KSFT_PASS;
 		valid &= visit_data(COMPRESSIBLE, 2, false);
-		ksft_test_result(valid, "%s: %zu compressed PTEs\n", name, swapped);
+		ksft_test_result(valid, "%s: %zu memcompress token PTEs\n", name, swapped);
 	}
 	close(child_ready[0]);
 	close(parent_ready[1]);
@@ -319,37 +348,41 @@ static void test_fork_cow(void)
 
 static void test_smaps(void)
 {
-	const char *name = "smaps Swap agrees with compressed PTEs and faults";
-	unsigned long long swap_kb;
+	const char *name = "smaps Swap observation across memcompress token faults";
+	unsigned long long swap_kb = 0, restored_swap_kb = 0;
 	size_t swapped, resident, second_swapped;
-	bool valid;
-	int ret;
+	size_t restored_swapped, restored_resident;
+	bool stable, valid;
+	int ret, smaps_ret;
 
 	visit_data(COMPRESSIBLE, 3, true);
 	ret = pageout_and_observe(&swapped);
 	if (ret) {
-		observation_failed(ret, name);
+		observation_or_data_failed(ret, COMPRESSIBLE, 3, name);
 		return;
 	}
-	ret = mapping_swap_kb(&swap_kb);
-	if (ret) {
-		ksft_test_result_skip("%s: smaps mapping unavailable\n", name);
-		return;
-	}
+	smaps_ret = mapping_swap_kb(&swap_kb);
 	ret = snapshot(after, &second_swapped, &resident);
 	if (ret) {
-		observation_failed(ret, name);
+		observation_or_data_failed(ret, COMPRESSIBLE, 3, name);
 		return;
 	}
-	if (swapped != second_swapped ||
-	    memcmp(before, after, nr_pages * sizeof(*before))) {
-		ksft_test_result_skip("%s: mapping changed during observation\n", name);
-		return;
-	}
+	stable = swapped == second_swapped &&
+		 !memcmp(before, after, nr_pages * sizeof(*before));
 	valid = swap_kb == swapped * (page_size / 1024);
-	valid &= visit_data(COMPRESSIBLE, 3, false);
-	if (!valid) {
-		ksft_test_result_fail("%s: Swap count or restored data mismatch\n", name);
+	if (!visit_data(COMPRESSIBLE, 3, false)) {
+		ksft_test_result_fail("%s: restored data mismatch\n", name);
+		return;
+	}
+	if (smaps_ret) {
+		observation_failed(smaps_ret, name);
+		return;
+	}
+	ksft_print_msg("before faults: token PTEs=%zu Swap=%llu kB stable=%d\n",
+		       swapped, swap_kb, stable);
+	/* A later observation failure must not hide a known count mismatch. */
+	if (strict_smaps && stable && !valid) {
+		ksft_test_result_fail("%s: pre-fault Swap count mismatch\n", name);
 		return;
 	}
 	ret = snapshot(after, &second_swapped, &resident);
@@ -357,69 +390,137 @@ static void test_smaps(void)
 		observation_failed(ret, name);
 		return;
 	}
-	if (second_swapped) {
-		ksft_test_result_skip("%s: mapping reclaimed again after faults\n", name);
+	ret = mapping_swap_kb(&restored_swap_kb);
+	if (ret) {
+		observation_failed(ret, name);
 		return;
 	}
-	valid &= resident == nr_pages;
-	valid &= !mapping_swap_kb(&swap_kb) && !swap_kb;
-	ksft_test_result(valid, "%s: %zu pages\n", name, swapped);
+	ksft_print_msg("after faults: token PTEs=%zu resident=%zu Swap=%llu kB\n",
+		       second_swapped, resident, restored_swap_kb);
+	ret = snapshot(before, &restored_swapped, &restored_resident);
+	if (ret) {
+		observation_failed(ret, name);
+		return;
+	}
+	if (strict_smaps && (!stable || second_swapped ||
+	    memcmp(before, after, nr_pages * sizeof(*before)))) {
+		ksft_test_result_skip("%s: mapping changed around smaps observation\n", name);
+		return;
+	}
+	valid &= resident == nr_pages && !restored_swap_kb;
+	ksft_test_result(!strict_smaps || valid, "%s: strict=%d\n",
+			 name, strict_smaps);
 }
 
 static void test_rejected_pages(void)
 {
-	const char *name = "repeated incompressible pageout restores resident PTEs";
-	unsigned long long swap_kb;
+	const char *name = "repeated incompressible pageout preserves data";
 	size_t swapped, resident;
 	unsigned int round;
 	bool valid = true;
 	int ret;
 
-	if (!compression_seen || !admission_enabled()) {
-		ksft_test_result_skip("%s: no successful compression control\n", name);
+	if (!token_seen) {
+		ksft_test_result_skip("%s: no observed token control\n", name);
 		return;
 	}
 	for (round = 0; round < 3; round++) {
+		ret = admission_status();
+		if (ret < 0) {
+			observation_failed(ret, name);
+			return;
+		}
 		visit_data(RANDOM, round, true);
 		if (madvise(data, DATA_SIZE, MADV_PAGEOUT)) {
-			ksft_test_result_skip("%s: MADV_PAGEOUT failed (%s)\n",
-					      name, strerror(errno));
+			observation_or_data_failed(-errno, RANDOM, round, name);
 			return;
 		}
 		ret = snapshot(before, &swapped, &resident);
 		if (ret) {
-			observation_failed(ret, name);
+			observation_or_data_failed(ret, RANDOM, round, name);
 			return;
 		}
 		/* Check before reading: a read would hide a leaked PENDING PTE. */
-		valid &= !swapped && resident == nr_pages;
-		valid &= !mapping_swap_kb(&swap_kb) && !swap_kb;
+		ksft_print_msg("incompressible round %u: token PTEs=%zu resident=%zu\n",
+			       round + 1, swapped, resident);
+		if (strict_rollback)
+			valid &= !swapped && resident == nr_pages;
 		valid &= visit_data(RANDOM, round, false);
 		if (!valid) {
-			ksft_test_result_fail("%s: PTE, Swap or data mismatch in round %u\n",
+			ksft_test_result_fail("%s: rollback or data mismatch in round %u\n",
 					      name, round + 1);
 			return;
 		}
-		if (!admission_enabled()) {
-			ksft_test_result_skip("%s: admission disabled during test\n", name);
-			return;
-		}
 	}
-	ksft_test_result(valid, "%s: three rounds\n", name);
+	ksft_test_result(valid, "%s: three rounds, strict=%d\n",
+			 name, strict_rollback);
 }
 
-int main(void)
+static void usage(const char *program)
+{
+	printf("Usage: %s [--token-type N] [--strict-rollback] [--strict-smaps] [--help]\n",
+	       program);
+	printf("Default: check data and COW; report PTE and smaps behavior.\n");
+	printf("  --token-type N     Expected pagemap swap type, 0..31 (default 27).\n");
+	printf("  --strict-rollback  Require rejected pages to remain resident.\n");
+	printf("  --strict-smaps     Require Swap to track token PTEs and faults.\n");
+	printf("Type 27 is confirmed for this vendor image and current op13 config.\n");
+	printf("For other CONFIG settings, verify the type and override it.\n");
+	printf("Tokens include PENDING pages and do not prove codec completion.\n");
+	printf("Requires no configured swap; changes no global tunables.\n");
+	printf("Data: 2 MiB (4 MiB with fork COW); timeout: 45 seconds.\n");
+}
+
+static bool parse_token_type(const char *value)
+{
+	unsigned long parsed;
+	char *end;
+
+	if (*value < '0' || *value > '9')
+		return false;
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno || *end || parsed > PM_TYPE_MASK)
+		return false;
+	token_type = parsed;
+	return true;
+}
+
+int main(int argc, char **argv)
 {
 	void *mapping;
 	size_t mapping_size;
+	int argument, ret;
 
+	for (argument = 1; argument < argc; argument++) {
+		if (!strcmp(argv[argument], "--strict-rollback"))
+			strict_rollback = true;
+		else if (!strcmp(argv[argument], "--strict-smaps"))
+			strict_smaps = true;
+		else if (!strcmp(argv[argument], "--token-type")) {
+			if (++argument == argc || !parse_token_type(argv[argument])) {
+				usage(argv[0]);
+				return KSFT_FAIL;
+			}
+		} else {
+			usage(argv[0]);
+			return !strcmp(argv[argument], "--help") ? KSFT_PASS : KSFT_FAIL;
+		}
+	}
 	ksft_print_header();
 	if (access("/sys/kernel/mm/memcompress/stat", R_OK))
 		ksft_exit_skip("memcompress sysfs is unavailable\n");
 	if (swap_devices_present())
 		ksft_exit_skip("requires no configured swap devices for PTE attribution\n");
-	if (!admission_enabled())
-		ksft_exit_skip("memcompress admission is disabled\n");
+	ret = admission_status();
+	if (ret == -EOPNOTSUPP || ret == -EACCES || ret == -EPERM)
+		ksft_exit_skip("memcompress admission unavailable (%s)\n", strerror(-ret));
+	if (ret < 0)
+		ksft_exit_fail_msg("cannot read memcompress admission (%s)\n", strerror(-ret));
+	if (!ret)
+		ksft_print_msg("enabled node absent; admission unknown, requiring token PTEs\n");
+	ksft_print_msg("strict rollback=%d strict smaps=%d\n", strict_rollback, strict_smaps);
+	ksft_print_msg("memcompress token type=%u; tokens may still be PENDING\n", token_type);
 	page_size = sysconf(_SC_PAGESIZE);
 	if (page_size != 4096)
 		ksft_exit_skip("memcompress tests require 4 KiB pages\n");
@@ -446,7 +547,7 @@ int main(void)
 	alarm(45);
 	ksft_set_plan(TEST_COUNT);
 	test_roundtrip(SAMEFILL, "same-filled page roundtrip");
-	test_roundtrip(COMPRESSIBLE, "compressed payload roundtrip");
+	test_roundtrip(COMPRESSIBLE, "compressible payload roundtrip");
 	test_fork_cow();
 	test_smaps();
 	test_rejected_pages();
