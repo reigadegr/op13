@@ -1376,17 +1376,19 @@ static const struct attribute_group memcompress_attr_group = {
 static void __init memcompress_choose_compressor(void)
 {
 	unsigned long highest = 0, second = 0;
-	unsigned int clusters = 0;
 	int cpu, other;
 
 	if (memcompress_compressor_user_set)
 		return;
-	for_each_possible_cpu(cpu) {
+	cpus_read_lock();
+	for_each_online_cpu(cpu) {
 		unsigned long capacity = 0;
 		int cluster = topology_cluster_id(cpu);
 		bool seen = false;
 
-		for_each_possible_cpu(other) {
+		if (cluster < 0 || cluster >= nr_cpu_ids)
+			continue;
+		for_each_online_cpu(other) {
 			if (other >= cpu)
 				break;
 			if (topology_cluster_id(other) == cluster) {
@@ -1396,10 +1398,11 @@ static void __init memcompress_choose_compressor(void)
 		}
 		if (seen)
 			continue;
-		for_each_possible_cpu(other)
+		for_each_online_cpu(other)
 			if (topology_cluster_id(other) == cluster)
 				capacity = max(capacity, arch_scale_cpu_capacity(other));
-		clusters++;
+		if (!capacity)
+			continue;
 		if (capacity >= highest) {
 			second = highest;
 			highest = capacity;
@@ -1407,8 +1410,8 @@ static void __init memcompress_choose_compressor(void)
 			second = capacity;
 		}
 	}
-	if ((clusters < 2 ? 0 : highest - second) <
-	    memcompress_capacity_threshold)
+	cpus_read_unlock();
+	if (highest - second < READ_ONCE(memcompress_capacity_threshold))
 		strscpy(memcompress_compressor, "lz4", sizeof(memcompress_compressor));
 	else if (crypto_has_comp("zstdp", 0, 0))
 		strscpy(memcompress_compressor, "zstdp", sizeof(memcompress_compressor));
