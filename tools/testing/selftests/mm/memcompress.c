@@ -1229,11 +1229,80 @@ static void test_packed_maintenance(const char *device, bool fail_io)
 	ksft_test_result(valid, "maintenance without swap retains compressed data\n");
 }
 
+#define DEBUG_STAT "/sys/kernel/mm/memcompress/debug_stat"
+
+struct staging_test_arg {
+	unsigned int id;
+	bool valid;
+};
+
+static void *staging_test_thread(void *opaque)
+{
+	struct staging_test_arg *arg = opaque;
+	size_t size = 256 * page_size, i;
+	uint64_t *buffer;
+	unsigned int round;
+
+	buffer = mmap(NULL, size, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (buffer == MAP_FAILED)
+		return NULL;
+	arg->valid = !madvise(buffer, size, MADV_NOHUGEPAGE);
+	for (round = 0; round < 8 && arg->valid; round++) {
+		for (i = 0; i < size / sizeof(*buffer); i++)
+			buffer[i] = ((uint64_t)arg->id << 48) ^ ((uint64_t)round << 32) ^
+				    (i / 512) ^ (i % 8);
+		arg->valid &= !madvise(buffer, size, MADV_PAGEOUT);
+		for (i = 0; i < size / sizeof(*buffer); i++)
+			arg->valid &= buffer[i] == (((uint64_t)arg->id << 48) ^
+				((uint64_t)round << 32) ^ (i / 512) ^ (i % 8));
+	}
+	munmap(buffer, size);
+	return NULL;
+}
+
+static void test_direct_staging(void)
+{
+	struct staging_test_arg args[8] = {};
+	pthread_t threads[8];
+	unsigned int i, started = 0;
+	long uses = named_stat(DEBUG_STAT, "staging_uses");
+	bool valid = named_stat(DEBUG_STAT, "staging_buffers") > 0;
+
+	valid &= packed_fixture();
+	valid &= named_stat(DEBUG_STAT, "staging_uses") > uses;
+	valid &= visit_data(COMPRESSIBLE, 0, false);
+	valid &= !named_stat(DEBUG_STAT, "staging_in_use");
+	valid &= !named_stat(DEBUG_STAT, "contexts_in_use");
+	ksft_test_result(valid, "direct staging roundtrip releases buffer and codec leases\n");
+
+	uses = named_stat(DEBUG_STAT, "staging_uses");
+	for (i = 0; i < ARRAY_SIZE(threads); i++) {
+		args[i].id = i + 1;
+		if (pthread_create(&threads[i], NULL, staging_test_thread, &args[i]))
+			break;
+		started++;
+	}
+	valid = started == ARRAY_SIZE(threads);
+	for (i = 0; i < started; i++) {
+		valid &= !pthread_join(threads[i], NULL);
+		valid &= args[i].valid;
+	}
+	valid &= named_stat(DEBUG_STAT, "staging_uses") > uses;
+	valid &= !named_stat(DEBUG_STAT, "staging_in_use");
+	valid &= !named_stat(DEBUG_STAT, "contexts_in_use");
+	ksft_print_msg("staging concurrent uses=%ld fallbacks=%ld\n",
+		       named_stat(DEBUG_STAT, "staging_uses") - uses,
+		       named_stat(DEBUG_STAT, "staging_fallbacks"));
+	ksft_test_result(valid, "concurrent staged pageout and faults preserve every word\n");
+}
+
 static void usage(const char *program)
 {
 	printf("Usage: %s [--token-type N] [--strict-rollback] [--strict-smaps]\n"
 	       "       [--thp-pages 4|8|16] [--thp-fail-alloc] [--help]\n",
 	       program);
+	printf("  --direct-staging Test direct zstd buffer ownership and concurrent pageout.\n");
 	printf("  --thp-pages N      Add THP tests; requires matching mTHP sysfs policy.\n");
 	printf("  --thp-fail-alloc   Requires task-filtered order>0 fail_page_alloc setup.\n");
 	printf("  --packed-swap DEV  Test packed I/O; removes the supplied active test swap.\n");
@@ -1274,7 +1343,7 @@ int main(int argc, char **argv)
 	int argument, ret;
 	const char *packed_device = NULL;
 	bool packed_fail_io = false, packed_swapoff = false, packed_fail_read = false;
-	bool packed_maintenance = false;
+	bool packed_maintenance = false, direct_staging = false;
 
 	for (argument = 1; argument < argc; argument++) {
 		if (!strcmp(argv[argument], "--packed-swap")) {
@@ -1289,6 +1358,8 @@ int main(int argc, char **argv)
 			packed_fail_read = true;
 		else if (!strcmp(argv[argument], "--packed-fail-io"))
 			packed_fail_io = true;
+		else if (!strcmp(argv[argument], "--direct-staging"))
+			direct_staging = true;
 		else if (!strcmp(argv[argument], "--strict-rollback"))
 			strict_rollback = true;
 		else if (!strcmp(argv[argument], "--strict-smaps"))
@@ -1361,12 +1432,15 @@ int main(int argc, char **argv)
 			test_packed_swap(packed_device, packed_fail_io);
 		goto out;
 	}
-	ksft_set_plan(TEST_COUNT + (thp_pages ? 10 : 0) + thp_fail_alloc);
+	ksft_set_plan(TEST_COUNT + (thp_pages ? 10 : 0) + thp_fail_alloc +
+		      (direct_staging ? 2 : 0));
 	test_roundtrip(SAMEFILL, "same-filled page roundtrip");
 	test_roundtrip(COMPRESSIBLE, "compressible payload roundtrip");
 	test_fork_cow();
 	test_smaps();
 	test_rejected_pages();
+	if (direct_staging)
+		test_direct_staging();
 	if (thp_pages) {
 		test_thp_access(false, false);
 		test_thp_access(true, false);

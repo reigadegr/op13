@@ -158,6 +158,11 @@ static struct memcompress_reclaim_node memcompress_nodes[MAX_NUMNODES];
 static struct kmem_cache *memcompress_entry_cache;
 static struct zpool *memcompress_pool;
 static unsigned int memcompress_nr_contexts;
+static u8 *memcompress_staging[MC_MAX_CONTEXTS];
+static unsigned int memcompress_nr_staging;
+static unsigned long memcompress_staging_free;
+static atomic64_t memcompress_staging_uses;
+static atomic64_t memcompress_staging_fallbacks;
 static unsigned long memcompress_context_all;
 static unsigned long memcompress_context_free;
 static unsigned long memcompress_context_foreground;
@@ -778,12 +783,38 @@ void memcompress_reclaim_ctx_put(struct memcompress_reclaim_ctx *ctx)
 	wake_up_all(&memcompress_context_wait);
 }
 
-static int memcompress_prepare_payload(struct memcompress_reclaim_ctx *ctx,
+static unsigned int memcompress_staging_get(void)
+{
+	unsigned long flags;
+	unsigned int index = MC_MAX_CONTEXTS;
+
+	spin_lock_irqsave(&memcompress_context_lock, flags);
+	if (memcompress_staging_free) {
+		index = __ffs(memcompress_staging_free);
+		memcompress_staging_free &= ~BIT(index);
+	}
+	spin_unlock_irqrestore(&memcompress_context_lock, flags);
+	return index;
+}
+
+static void memcompress_staging_put(unsigned int index)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&memcompress_context_lock, flags);
+	memcompress_staging_free |= BIT(index);
+	spin_unlock_irqrestore(&memcompress_context_lock, flags);
+}
+
+static int memcompress_prepare_payload(struct memcompress_reclaim_ctx **ctxp,
 				      const void *src, bool multi_page,
 				      struct memcompress_payload *payload)
 {
-	unsigned int length = PAGE_SIZE * 2;
+	struct memcompress_reclaim_ctx *ctx = *ctxp;
+	unsigned int length = PAGE_SIZE * 2, staging = MC_MAX_CONTEXTS;
 	unsigned int huge_class = zs_huge_class_size(NULL);
+	bool background = ctx->background;
+	void *dst = ctx->dst;
 	gfp_t gfp = GFP_NOWAIT | __GFP_NOWARN | __GFP_NORETRY;
 	const void *data;
 	void *mapped;
@@ -797,34 +828,53 @@ static int memcompress_prepare_payload(struct memcompress_reclaim_ctx *ctx,
 	if (!multi_page && ctx->shadow_enabled &&
 	    memcompress_classifier_bypass(src, ctx))
 		return -E2BIG;
-	ret = crypto_comp_compress(ctx->tfm, src, PAGE_SIZE, ctx->dst, &length);
+	if (!multi_page && ctx->shadow_enabled) {
+		staging = memcompress_staging_get();
+		if (staging != MC_MAX_CONTEXTS)
+			dst = memcompress_staging[staging];
+		else
+			atomic64_inc(&memcompress_staging_fallbacks);
+	}
+	ret = crypto_comp_compress(ctx->tfm, src, PAGE_SIZE, dst, &length);
+	if (staging != MC_MAX_CONTEXTS) {
+		/* The independent destination outlives this codec lease. */
+		memcompress_reclaim_ctx_put(ctx);
+		*ctxp = NULL;
+		atomic64_inc(&memcompress_staging_uses);
+	}
 	if (ret)
-		return ret;
+		goto out;
 	/* zsmalloc's huge-class query is global and does not inspect its pool. */
 	if (length >= PAGE_SIZE || (huge_class && length >= huge_class)) {
-		if (!multi_page)
-			return -E2BIG;
+		if (!multi_page) {
+			ret = -E2BIG;
+			goto out;
+		}
 		length = PAGE_SIZE;
 		data = src;
 	} else {
-		data = ctx->dst;
+		data = dst;
 	}
 	ret = zpool_malloc(memcompress_pool, length, gfp, &payload->handle);
-	if (ret && ctx->background)
+	if (ret && background)
 		ret = zpool_malloc(memcompress_pool, length,
 				   GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY,
 				   &payload->handle);
 	if (ret)
-		return ret;
+		goto out;
 	mapped = zpool_map_handle(memcompress_pool, payload->handle, ZPOOL_MM_WO);
 	if (!mapped) {
 		zpool_free(memcompress_pool, payload->handle);
-		return -EIO;
+		ret = -EIO;
+		goto out;
 	}
 	memcpy(mapped, data, length);
 	zpool_unmap_handle(memcompress_pool, payload->handle);
 	payload->length = length;
-	return 0;
+out:
+	if (staging != MC_MAX_CONTEXTS)
+		memcompress_staging_put(staging);
+	return ret;
 }
 
 static struct memcompress_entry *memcompress_entry_alloc(struct folio *folio)
@@ -1031,7 +1081,7 @@ bool memcompress_store_cache(struct folio *folio, unsigned long *token)
 		payload.handle = *(const u64 *)src;
 	} else {
 		ctx = memcompress_context_get(MEMCOMPRESS_RECLAIM_DIRECT, true);
-		if (!ctx || memcompress_prepare_payload(ctx, src, false, &payload))
+		if (!ctx || memcompress_prepare_payload(&ctx, src, false, &payload))
 			goto free_entry;
 	}
 	if (memcompress_entry_charge(entry, payload.length))
@@ -1116,7 +1166,7 @@ bool memcompress_store_after_unmap(struct folio *folio,
 	for (i = 0; i < nr_pages; i++) {
 		const void *src = page_address(folio_page(folio, i));
 
-		if (!src || memcompress_prepare_payload(ctx, src, nr_pages != 1,
+		if (!src || memcompress_prepare_payload(&ctx, src, nr_pages != 1,
 						       &payload[i]))
 			goto free_payload;
 		total_length += payload[i].length;
@@ -2173,13 +2223,20 @@ static ssize_t debug_stat_show(struct kobject *kobj, struct kobj_attribute *attr
 	return sysfs_emit(buf,
 		"stored_bytes %ld\ncompressed_bytes %ld\npool_bytes %llu\n"
 		"same_filled_pages %ld\nclassifier_calls %lld\n"
-		"classifier_bypasses %lld\n",
+		"classifier_bypasses %lld\n"
+		"staging_buffers %u\nstaging_in_use %lu\ncontexts_in_use %lu\n"
+		"staging_uses %lld\nstaging_fallbacks %lld\n",
 		atomic_long_read(&memcompress_stored_bytes),
 		atomic_long_read(&memcompress_compressed_bytes),
 		zpool_get_total_size(memcompress_pool),
 		atomic_long_read(&memcompress_same_filled_pages),
 		atomic64_read(&memcompress_classifier_calls),
-		atomic64_read(&memcompress_classifier_bypasses));
+		atomic64_read(&memcompress_classifier_bypasses),
+		memcompress_nr_staging,
+		memcompress_nr_staging - hweight_long(READ_ONCE(memcompress_staging_free)),
+		memcompress_nr_contexts - hweight_long(READ_ONCE(memcompress_context_free)),
+		atomic64_read(&memcompress_staging_uses),
+		atomic64_read(&memcompress_staging_fallbacks));
 }
 
 static struct kobj_attribute defrag_attr = __ATTR_WO(defrag);
@@ -2308,6 +2365,16 @@ static int __init memcompress_init(void)
 	if (memcompress_nr_contexts < wanted)
 		pr_warn("prepared only %u of %u compression contexts: %d\n",
 			memcompress_nr_contexts, wanted, ret);
+	for (i = 0; i < memcompress_nr_contexts; i++) {
+		memcompress_staging[i] = kmalloc(PAGE_SIZE * 2, GFP_KERNEL);
+		if (!memcompress_staging[i])
+			break;
+		memcompress_staging_free |= BIT(i);
+	}
+	memcompress_nr_staging = i;
+	if (memcompress_nr_staging < memcompress_nr_contexts)
+		pr_warn("prepared only %u of %u staging buffers\n",
+			memcompress_nr_staging, memcompress_nr_contexts);
 	for_each_possible_cpu(cpu) {
 		struct memcompress_decomp_ctx *ctx;
 
@@ -2361,6 +2428,12 @@ free_decomp_contexts:
 		ctx->tfm = NULL;
 	}
 free_contexts:
+	for (i = 0; i < memcompress_nr_staging; i++) {
+		kfree(memcompress_staging[i]);
+		memcompress_staging[i] = NULL;
+	}
+	memcompress_nr_staging = 0;
+	memcompress_staging_free = 0;
 	for (i = 0; i < memcompress_nr_contexts; i++) {
 		if (memcompress_contexts[i].tfm)
 			crypto_free_comp(memcompress_contexts[i].tfm);
