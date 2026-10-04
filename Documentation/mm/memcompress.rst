@@ -147,6 +147,33 @@ recorded in ``results/zstd-default-20261004`` in the companion checkout. It has
 not yet been tested on the phone. Keep these codec and validation scopes
 separate when interpreting results.
 
+Vendor parity backlog
+=====================
+
+The companion memc checkout tracks open implementation and validation work in
+``MEMCOMPRESS_TODO.md``, with links to the original device reports and audits.
+Its first priority is grouped fault-in. In both the sequential and random
+THP-advice cases, each of three 8 MiB rounds started with 2048 token PTEs.
+The vendor recorded 133 token first-touch samples per round; the native lz4
+build recorded 2048. All data checks passed. These are userspace samples of
+PTE state immediately before access, not traced memcompress_load() call counts.
+The difference is consistent with the vendor's grouped recovery, but actual
+folio sizes and call chains were not measured. It is not a performance ratio.
+
+The remaining implementation backlog includes:
+
+* Grouped fault-in, with eligibility, ownership and single-page fallback.
+* Compressed-pool packed writeback, dedicated swapoff, defrag and drain.
+* Vendor zstdp/lz4p codecs, page/fast interfaces and direct staging.
+* Vendor zsmalloc hybrid-chain and allocation/rescue extensions.
+* UFFDIO_MOVE support for compressed token mappings.
+* Per-pool slab naming, reclaim accounting and initialization details.
+
+Keep missing implementation separate from missing validation of existing
+paths. Async multi-page folios, failure injection, node-stop drainage,
+concurrent lifetimes, MTE/UFFD/memcg combinations and sustained phone tests
+still need coverage. The checklist records acceptance evidence for each item.
+
 Reproducing the QEMU functional checks
 =====================================
 
