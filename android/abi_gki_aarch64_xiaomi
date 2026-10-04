@@ -492,10 +492,6 @@
   bio_init
   __bio_add_page
   blkdev_get_by_dev
-  __traceiter_android_vh_handle_folio_writeback
-  __tracepoint_android_vh_handle_folio_writeback
-  __traceiter_android_vh_reclaim_before_kswapd
-  __tracepoint_android_vh_reclaim_before_kswapd
   __traceiter_android_rvh_swap_bio_charge
   __tracepoint_android_rvh_swap_bio_charge
 
@@ -576,6 +572,17 @@ __tracepoint_android_vh_do_new_mount_fc
 __tracepoint_android_vh_put_super
 LZ4_compress_default
 find_inode_nowait
+
+__traceiter_android_vh_remove_mapping
+__traceiter_android_vh_remove_mapping_failed
+__traceiter_android_vh_filemap_get_folio_end
+__traceiter_android_vh_do_new_mount_fc
+__traceiter_android_vh_put_super
+__tracepoint_android_vh_remove_mapping
+__tracepoint_android_vh_remove_mapping_failed
+__tracepoint_android_vh_filemap_get_folio_end
+__tracepoint_android_vh_do_new_mount_fc
+__tracepoint_android_vh_put_super
 
 # required by zsmalloc.ko
 __traceiter_android_vh_zs_shrinker_adjust

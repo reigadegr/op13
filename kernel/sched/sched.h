@@ -8,6 +8,7 @@
 #include <linux/sched/affinity.h>
 #include <linux/sched/autogroup.h>
 #include <linux/sched/cpufreq.h>
+#include <linux/sched/cputime.h>
 #include <linux/sched/deadline.h>
 #include <linux/sched.h>
 #include <linux/sched/loadavg.h>
@@ -186,9 +187,14 @@ static inline int idle_policy(int policy)
 {
 	return policy == SCHED_IDLE;
 }
+
 static inline int fair_policy(int policy)
 {
+#ifdef CONFIG_HMBIRD_SCHED
+	return policy == SCHED_HMBIRD || policy == SCHED_NORMAL || policy == SCHED_BATCH;
+#else
 	return policy == SCHED_NORMAL || policy == SCHED_BATCH;
+#endif
 }
 
 static inline int rt_policy(int policy)
@@ -502,6 +508,13 @@ extern void set_task_rq_fair(struct sched_entity *se,
 static inline void set_task_rq_fair(struct sched_entity *se,
 			     struct cfs_rq *prev, struct cfs_rq *next) { }
 #endif /* CONFIG_SMP */
+#else /* CONFIG_FAIR_GROUP_SCHED */
+#ifdef CONFIG_HMBIRD_SCHED
+static inline int sched_group_set_shares(struct task_group *tg, unsigned long shares)
+{
+	return 0;
+}
+#endif
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 
 #else /* CONFIG_CGROUP_SCHED */
@@ -3594,5 +3607,8 @@ static inline bool cpu_busy_with_softirqs(int cpu)
 }
 #endif /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
 
+#ifdef CONFIG_HMBIRD_SCHED
+#include "hmbird.h"
+#endif
 
 #endif /* _KERNEL_SCHED_SCHED_H */

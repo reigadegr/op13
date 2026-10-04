@@ -106,6 +106,7 @@ static struct unix_vertex *unix_edge_successor(struct unix_edge *edge)
 	/* If an embryo socket has a fd,
 	 * the listener indirectly holds the fd's refcnt.
 	 */
+
 	if (edge->successor->listener)
 		return unix_sk(edge->successor->listener)->vertex;
 
