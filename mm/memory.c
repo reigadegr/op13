@@ -4159,18 +4159,78 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 
 static DECLARE_WAIT_QUEUE_HEAD(swapcache_wq);
 
+/* All protection bits must agree before installing a single PTE batch. */
+static bool memcompress_fault_ptes_match(struct vm_fault *vmf, pte_t *ptep,
+					unsigned long token, unsigned int nr_pages)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_pages; i++) {
+		pte_t expected = swp_entry_to_pte(swp_entry(SWP_MEMCOMPRESS, token + i));
+
+		if (pte_swp_exclusive(vmf->orig_pte))
+			expected = pte_swp_mkexclusive(expected);
+		if (pte_swp_soft_dirty(vmf->orig_pte))
+			expected = pte_swp_mksoft_dirty(expected);
+		if (pte_swp_uffd_wp(vmf->orig_pte))
+			expected = pte_swp_mkuffd_wp(expected);
+		if (!pte_same(ptep_get(ptep + i), expected))
+			return false;
+	}
+	return true;
+}
+
+static unsigned int memcompress_fault_nr_pages(struct vm_fault *vmf,
+					       unsigned long token)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	unsigned long base, addr, size, orders;
+	unsigned int nr_pages, page_idx;
+	pte_t *ptep;
+	bool matches;
+
+	if (!vma_is_anonymous(vma) || !vma->anon_vma || userfaultfd_armed(vma))
+		return 1;
+	nr_pages = memcompress_entry_nr_pages(token, &base);
+	if (nr_pages < 2 || !is_power_of_2(nr_pages))
+		return 1;
+	page_idx = token - base;
+	size = nr_pages * PAGE_SIZE;
+	if (vmf->address < page_idx * PAGE_SIZE)
+		return 1;
+	addr = vmf->address - page_idx * PAGE_SIZE;
+	if (!IS_ALIGNED(addr, size) || addr < vma->vm_start ||
+	    size > vma->vm_end - addr ||
+	    (addr & PMD_MASK) != ((addr + size - 1) & PMD_MASK))
+		return 1;
+	orders = thp_vma_allowable_orders(vma, vma->vm_flags,
+			TVA_IN_PF | TVA_ENFORCE_SYSFS, BIT(ilog2(nr_pages)));
+	if (!thp_vma_suitable_orders(vma, vmf->address, orders))
+		return 1;
+	ptep = pte_offset_map_lock(vma->vm_mm, vmf->pmd, addr, &vmf->ptl);
+	if (!ptep)
+		return 1;
+	matches = memcompress_fault_ptes_match(vmf, ptep, base, nr_pages);
+	pte_unmap_unlock(ptep, vmf->ptl);
+	return matches ? nr_pages : 1;
+}
+
 static vm_fault_t do_memcompress_page(struct vm_fault *vmf, swp_entry_t swp)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	struct memcompress_entry *entry;
+	struct memcompress_entry *entries[MEMCOMPRESS_MAX_FOLIO_PAGES] = {};
 	struct folio *folio = NULL;
 	struct page *page;
-	unsigned int page_idx = 0;
+	unsigned long addr = vmf->address, base = swp_offset(swp);
+	unsigned int page_idx = 0, nr_pages = 1, i;
 	vm_fault_t ret = 0;
 	rmap_t rmap_flags = RMAP_NONE;
 	bool pending = false, exclusive;
 	pte_t pte;
+	pte_t *ptep;
+	gfp_t gfp;
 	int err;
 
 	entry = memcompress_load_folio_pin(swp_offset(swp));
@@ -4178,6 +4238,7 @@ static vm_fault_t do_memcompress_page(struct vm_fault *vmf, swp_entry_t swp)
 		ret = VM_FAULT_SIGBUS;
 		goto check_error;
 	}
+	entries[0] = entry;
 
 	folio = memcompress_pending_folio(entry, &page_idx);
 	if (folio) {
@@ -4197,21 +4258,31 @@ static vm_fault_t do_memcompress_page(struct vm_fault *vmf, swp_entry_t swp)
 	}
 
 	if (!pending) {
-		folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE | __GFP_CMA, 0,
-					vma, vmf->address, false);
-		if (!folio) {
-			ret = VM_FAULT_OOM;
-			goto abort_entry;
+		page_idx = 0;
+		nr_pages = memcompress_fault_nr_pages(vmf, swp_offset(swp));
+		if (nr_pages > 1 && !memcompress_load_group_pin(entry, entries, nr_pages))
+			nr_pages = 1;
+		if (nr_pages == 1)
+			entries[0] = entry;
+		else {
+			addr = ALIGN_DOWN(vmf->address, nr_pages * PAGE_SIZE);
+			page_idx = (vmf->address - addr) / PAGE_SIZE;
+			base -= page_idx;
 		}
-		if (mem_cgroup_charge(folio, mm, GFP_KERNEL)) {
+retry_alloc:
+		gfp = nr_pages > 1 ? GFP_TRANSHUGE_LIGHT | __GFP_CMA :
+			GFP_HIGHUSER_MOVABLE | __GFP_CMA;
+		folio = vma_alloc_folio(gfp, ilog2(nr_pages), vma, addr, nr_pages > 1);
+		if (!folio)
+			goto fallback;
+		if (mem_cgroup_charge(folio, mm, nr_pages > 1 ? gfp : GFP_KERNEL)) {
 			folio_put(folio);
 			folio = NULL;
-			ret = VM_FAULT_OOM;
-			goto abort_entry;
+			goto fallback;
 		}
 		__folio_set_locked(folio);
 		__folio_set_swapbacked(folio);
-		err = memcompress_load_folio(entry, folio);
+		err = memcompress_load_group(entries, folio);
 		if (err) {
 			ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
 			if (err == -EAGAIN)
@@ -4219,17 +4290,21 @@ static vm_fault_t do_memcompress_page(struct vm_fault *vmf, swp_entry_t swp)
 			goto release_folio;
 		}
 		__folio_mark_uptodate(folio);
-		page_idx = 0;
 	}
-	page = folio_page(folio, page_idx);
-	if (unlikely(PageHWPoison(page))) {
-		ret = VM_FAULT_HWPOISON;
-		goto release_folio;
+	page = folio_page(folio, pending ? page_idx : 0);
+	for (i = 0; i < nr_pages; i++) {
+		if (unlikely(PageHWPoison(page + i))) {
+			ret = VM_FAULT_HWPOISON;
+			goto release_folio;
+		}
 	}
 
 	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
 	if (unlikely(!vmf->pte ||
 		     !pte_same(ptep_get(vmf->pte), vmf->orig_pte)))
+		goto unlock;
+	ptep = vmf->pte - (pending ? 0 : page_idx);
+	if (nr_pages > 1 && !memcompress_fault_ptes_match(vmf, ptep, base, nr_pages))
 		goto unlock;
 
 	/* Pending tokens can coexist with aliases that still map the old folio. */
@@ -4253,28 +4328,46 @@ static vm_fault_t do_memcompress_page(struct vm_fault *vmf, swp_entry_t swp)
 		}
 	}
 
-	inc_mm_counter(mm, MM_ANONPAGES);
-	dec_mm_counter(mm, MM_SWAPENTS);
+	add_mm_counter(mm, MM_ANONPAGES, nr_pages);
+	add_mm_counter(mm, MM_SWAPENTS, -(long)nr_pages);
 	if (pending) {
 		folio_add_anon_rmap_ptes(folio, page, 1, vma, vmf->address,
 					rmap_flags);
 	} else {
-		folio_add_new_anon_rmap(folio, vma, vmf->address, RMAP_EXCLUSIVE);
+		folio_ref_add(folio, nr_pages - 1);
+		folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
 		folio_add_lru_vma(folio, vma);
 	}
-	flush_icache_pages(vma, page, 1);
-	vmf->orig_pte = pte;
-	set_pte_at(mm, vmf->address, vmf->pte, pte);
-	arch_do_swap_page_nr(mm, vma, vmf->address, pte, pte, 1);
-	memcompress_load_folio_commit(entry);
+	flush_icache_pages(vma, page, nr_pages);
+	vmf->orig_pte = pte_advance_pfn(pte, pending ? 0 : page_idx);
+	set_ptes(mm, addr, ptep, pte, nr_pages);
+	arch_do_swap_page_nr(mm, vma, addr, pte, pte, nr_pages);
+	for (i = 0; i < nr_pages; i++)
+		memcompress_load_folio_commit(entries[i]);
 	folio_unlock(folio);
 	if (vmf->flags & FAULT_FLAG_WRITE)
 		return do_wp_page(vmf);
-	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+	update_mmu_cache_range(vmf, vma, addr, ptep, nr_pages);
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 	vmf->pte = NULL;
 	return VM_FAULT_NOPAGE;
 
+fallback:
+	if (nr_pages > 1) {
+		for (i = 0; i < nr_pages; i++) {
+			if (entries[i] != entry)
+				memcompress_load_folio_abort(entries[i]);
+			entries[i] = NULL;
+		}
+		nr_pages = 1;
+		entries[0] = entry;
+		page_idx = 0;
+		addr = vmf->address;
+		base = swp_offset(swp);
+		goto retry_alloc;
+	}
+	ret = VM_FAULT_OOM;
+	goto abort_entry;
 unlock:
 	if (vmf->pte) {
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
@@ -4284,7 +4377,8 @@ release_folio:
 	folio_unlock(folio);
 	folio_put(folio);
 abort_entry:
-	memcompress_load_folio_abort(entry);
+	for (i = 0; i < nr_pages; i++)
+		memcompress_load_folio_abort(entries[i]);
 check_error:
 	if (!ret)
 		return 0;

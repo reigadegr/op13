@@ -152,7 +152,7 @@ Vendor parity backlog
 
 The companion memc checkout tracks open implementation and validation work in
 ``MEMCOMPRESS_TODO.md``, with links to the original device reports and audits.
-Its first priority is grouped fault-in. In both the sequential and random
+The original first priority was grouped fault-in. In both the sequential and random
 THP-advice cases, each of three 8 MiB rounds started with 2048 token PTEs.
 The vendor recorded 133 token first-touch samples per round; the native lz4
 build recorded 2048. All data checks passed. These are userspace samples of
@@ -162,7 +162,6 @@ folio sizes and call chains were not measured. It is not a performance ratio.
 
 The remaining implementation backlog includes:
 
-* Grouped fault-in, with eligibility, ownership and single-page fallback.
 * Compressed-pool packed writeback, dedicated swapoff, defrag and drain.
 * Vendor zstdp/lz4p codecs, page/fast interfaces and direct staging.
 * Vendor zsmalloc hybrid-chain and allocation/rescue extensions.
@@ -173,6 +172,47 @@ Keep missing implementation separate from missing validation of existing
 paths. Async multi-page folios, failure injection, node-stop drainage,
 concurrent lifetimes, MTE/UFFD/memcg combinations and sustained phone tests
 still need coverage. The checklist records acceptance evidence for each item.
+
+Grouped fault recovery
+======================
+
+Fresh faults now recover the original small-folio group when its immutable
+entry metadata, consecutive tokens, aligned VMA/PMD interval, anonymous THP
+policy and complete PTE contents agree. UFFD-armed VMAs retain per-page faults.
+All group entries stay pinned through decompression and final PTE validation.
+A missing member, allocation failure or charge failure falls back once to a
+base page. A final PTE race discards temporary output and retries the fault;
+it never consumes the changed PTE's reference. Pending original folios keep
+the existing conservative single-page COW path.
+
+New folios receive one reference per installed PTE, full RSS/rmap/LRU accounting
+and architecture swap metadata restoration before entry references are consumed.
+The original fault's PTE pointer and resident orig_pte remain at its actual
+subpage, including when a later write-protection fault is needed. The native
+per-VMA lock protocol remains supported, as in anonymous mTHP allocation.
+
+The companion checkout records the implementation in ``THP_FAULTIN.md`` and
+results in ``results/thp-faultin-20261004``. Its QEMU runner supports
+``--thp-pages 4|8|16`` and ``--faults-only``. Extended selftests use aligned
+8 MiB mappings, verify compound head/tail flags and PFN continuity, and check
+three sequential/random rounds, THP policy fallback, partial PTEs, VMA splits,
+fork/COW, concurrent faults/unmap/remap, UFFD missing and nonzero-subpage writes.
+Controlled access loops pin the calling thread so MADV_PAGEOUT drains all of
+its pending LRU additions; concurrent tests retain the original affinity.
+
+``--benchmark`` runs the unchanged 8 MiB/three-round access matrix, requiring
+2048 MiB guest RAM. Counts depend on the actual grouping and mapping alignment;
+133 is a historical phone observation, not a universal acceptance threshold.
+A separate debug build enables FAULT_INJECTION, FAIL_PAGE_ALLOC and
+FAULT_INJECTION_DEBUG_FS for ``--thp-fail-alloc``. The guest targets one
+order>0 allocation in the marked selftest task after storing its token group.
+The selftest verifies consumption of the injection and a base-page fallback.
+
+These are functional TCG checks, not phone performance or MTE validation.
+Memcg charge-failure injection, UFFD minor/WP combinations, every exact race
+window and sustained phone workloads remain untested. The ARM64 configuration
+does not support soft-dirty tracking. Cross-architecture allmodconfig builds
+were not run; the production ARM64 Image/BTF build is the validated build.
 
 Reproducing the QEMU functional checks
 =====================================
@@ -204,7 +244,7 @@ Prepare an immutable input copy and compile the existing selftest::
     export MEMC_KERNEL="$HOME/kernel_workspace/op13"
     export MEMC_QEMU="$HOME/.tmp/memcompress-qemu/qemu-system-aarch64"
     cp "$MEMC_KERNEL/out/arch/arm64/boot/Image" "$MEMC_RUN/Image"
-    aarch64-linux-gnu-gcc -O2 -static -Wall -Wextra -Werror \
+    aarch64-linux-gnu-gcc -O2 -static -pthread -Wall -Wextra -Werror \
       "$MEMC_KERNEL/tools/testing/selftests/mm/memcompress.c" \
       -o "$MEMC_RUN/memcompress-selftest"
     cd "$HOME/project/memc"

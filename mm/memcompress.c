@@ -1154,19 +1154,60 @@ unlock:
 	return ret;
 }
 
-int memcompress_load_folio(struct memcompress_entry *entry, struct folio *folio)
+bool memcompress_load_group_pin(struct memcompress_entry *entry,
+		struct memcompress_entry **entries, unsigned int nr_pages)
 {
+	unsigned long base;
+	unsigned int i;
+
+	/* Group identity is immutable after publication in the xarray. */
+	if (nr_pages < 2 || nr_pages > MEMCOMPRESS_MAX_FOLIO_PAGES ||
+	    !is_power_of_2(nr_pages) || entry->nr_pages != nr_pages ||
+	    entry->page_idx >= nr_pages || entry->token <= entry->page_idx)
+		return false;
+	base = entry->token - entry->page_idx;
+	if (base > U32_MAX - nr_pages + 1)
+		return false;
+	for (i = 0; i < nr_pages; i++) {
+		entries[i] = i == entry->page_idx ? entry :
+			memcompress_get_entry(base + i);
+		if (!entries[i] || entries[i]->nr_pages != nr_pages ||
+		    entries[i]->page_idx != i)
+			goto abort;
+	}
+	return true;
+abort:
+	do {
+		if (entries[i] != entry)
+			memcompress_entry_put(entries[i]);
+		entries[i] = NULL;
+	} while (i--);
+	return false;
+}
+
+int memcompress_load_group(struct memcompress_entry **entries, struct folio *folio)
+{
+	unsigned int i, nr_pages = folio_nr_pages(folio);
 	int ret;
 
-	if (!folio || folio_test_large(folio))
-		return -EINVAL;
-	ret = memcompress_do_load_entry(entry, page_address(folio_page(folio, 0)));
-	if (ret)
-		return ret;
-	arch_swap_restore(swp_entry(SWP_MEMCOMPRESS, entry->token), folio);
+	for (i = 0; i < nr_pages; i++) {
+		ret = memcompress_do_load_entry(entries[i],
+					page_address(folio_page(folio, i)));
+		if (ret)
+			return ret;
+	}
+	/* Keep every token pinned until architecture metadata is restored. */
+	arch_swap_restore(swp_entry(SWP_MEMCOMPRESS, entries[0]->token), folio);
 	flush_dcache_folio(folio);
 	folio_mark_uptodate(folio);
 	return 0;
+}
+
+int memcompress_load_folio(struct memcompress_entry *entry, struct folio *folio)
+{
+	if (!folio || folio_test_large(folio))
+		return -EINVAL;
+	return memcompress_load_group(&entry, folio);
 }
 
 int memcompress_read_token(unsigned long token, struct folio *folio)

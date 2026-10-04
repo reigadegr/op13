@@ -3,8 +3,8 @@
  * Bounded memcompress data-integrity and cross-implementation observations.
  *
  * Only this process's anonymous mapping is reclaimed, using MADV_PAGEOUT.
- * No global tunable is changed. Test data uses 2 MiB, at most 4 MiB after
- * fork COW. Run on a memcompress kernel with no configured swap devices;
+ * No global tunable is changed. Test data uses 2 MiB (8 MiB with THP tests),
+ * doubled after fork COW. Run on a memcompress kernel with no configured swap devices;
  * otherwise pagemap cannot identify this private swap type portably.
  * Strict rollback and smaps checks are opt-in port regression assertions.
  * Token PTEs can refer to PENDING pages; they do not prove codec completion.
@@ -12,6 +12,12 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <linux/userfaultfd.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -25,7 +31,10 @@
 
 #include "../kselftest.h"
 
-#define DATA_SIZE (2UL * 1024 * 1024)
+#define THP_ALIGN (64UL * 1024)
+static size_t data_size = 2UL * 1024 * 1024;
+static unsigned int thp_pages;
+static bool thp_fail_alloc;
 #define PM_PRESENT (1ULL << 63)
 #define PM_SWAP (1ULL << 62)
 #define PM_FRAME_MASK ((1ULL << 55) - 1)
@@ -186,7 +195,7 @@ static int mapping_swap_kb(unsigned long long *swap_kb)
 	while (fgets(line, sizeof(line), file)) {
 		if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
 			selected = start == (uintptr_t)data &&
-				   end == (uintptr_t)data + DATA_SIZE;
+				   end == (uintptr_t)data + data_size;
 		} else if (selected && sscanf(line, "Swap: %llu kB", swap_kb) == 1) {
 			ret = 0;
 			break;
@@ -207,7 +216,7 @@ static int pageout_and_observe(size_t *swapped)
 		ret = admission_status();
 		if (ret < 0)
 			return ret;
-		if (madvise(data, DATA_SIZE, MADV_PAGEOUT))
+		if (madvise(data, data_size, MADV_PAGEOUT))
 			return -errno;
 		ret = snapshot(before, swapped, &resident);
 		if (ret)
@@ -431,7 +440,7 @@ static void test_rejected_pages(void)
 			return;
 		}
 		visit_data(RANDOM, round, true);
-		if (madvise(data, DATA_SIZE, MADV_PAGEOUT)) {
+		if (madvise(data, data_size, MADV_PAGEOUT)) {
 			observation_or_data_failed(-errno, RANDOM, round, name);
 			return;
 		}
@@ -456,10 +465,347 @@ static void test_rejected_pages(void)
 			 name, strict_rollback);
 }
 
+
+/* PFN contiguity alone is insufficient: require compound head/tail flags. */
+static bool compound_group(size_t start)
+{
+	uint64_t entries[16], flags, pfn;
+	int fd = open("/proc/kpageflags", O_RDONLY);
+	unsigned int i;
+	bool valid = fd >= 0;
+
+	if (!valid || pread(pagemap_fd, entries, thp_pages * sizeof(*entries),
+		((uintptr_t)data / page_size + start) * sizeof(*entries)) !=
+		(ssize_t)(thp_pages * sizeof(*entries))) {
+		if (fd >= 0)
+			close(fd);
+		return false;
+	}
+	pfn = entries[0] & PM_FRAME_MASK;
+	for (i = 0; i < thp_pages && valid; i++) {
+		valid = (entries[i] & PM_PRESENT) && pfn &&
+			(entries[i] & PM_FRAME_MASK) == pfn + i &&
+			pread(fd, &flags, sizeof(flags), (pfn + i) * sizeof(flags)) ==
+			(ssize_t)sizeof(flags);
+		if (valid)
+			valid = !!(flags & (1ULL << (i ? 16 : 15)));
+	}
+	/* The next physical page must not be another tail of this folio. */
+	if (valid)
+		valid = pread(fd, &flags, sizeof(flags),
+			(pfn + thp_pages) * sizeof(flags)) == (ssize_t)sizeof(flags) &&
+			!(flags & (1ULL << 16));
+	close(fd);
+	return valid;
+}
+
+static bool prepare_thp(void)
+{
+	return !madvise(data, data_size, MADV_DONTNEED) &&
+		!madvise(data, data_size, MADV_HUGEPAGE) &&
+		visit_data(COMPRESSIBLE, 0, true) && compound_group(0);
+}
+
+/* Admission can leave a stable partial batch; wait for the whole fixture. */
+static bool thp_pageout(void)
+{
+	size_t swapped = 0;
+	unsigned int attempt;
+	int ret = 0;
+
+	for (attempt = 0; attempt < 20; attempt++) {
+		ret = pageout_and_observe(&swapped);
+		if (!ret && swapped == nr_pages)
+			return true;
+		if (ret && ret != -EAGAIN)
+			break;
+		usleep(10000);
+	}
+	ksft_print_msg("THP fixture incomplete: ret=%d tokens=%zu expected=%zu\n",
+		       ret, swapped, nr_pages);
+	return false;
+}
+
+static uint64_t monotonic_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static void test_thp_access(bool random, bool nohuge)
+{
+	const char *name = nohuge ? "THP disabled before recovery" :
+		random ? "THP random grouped recovery" : "THP sequential grouped recovery";
+	size_t *order = calloc(nr_pages, sizeof(*order));
+	size_t swapped, resident, touches, i, j, word;
+	uint64_t state = 0x6d656d636f6d7072ULL, start, entry;
+	cpu_set_t saved, pinned;
+	int cpu = sched_getcpu();
+	bool affinity = !sched_getaffinity(0, sizeof(saved), &saved);
+	bool valid;
+	unsigned int round;
+
+	/* MADV_PAGEOUT drains only the calling CPU's pending LRU additions. */
+	CPU_ZERO(&pinned);
+	if (cpu >= 0)
+		CPU_SET(cpu, &pinned);
+	valid = affinity && cpu >= 0 && !sched_setaffinity(0, sizeof(pinned), &pinned);
+	valid &= order && prepare_thp();
+	if (valid && nohuge)
+		valid = !madvise(data, data_size, MADV_NOHUGEPAGE);
+	for (i = 0; order && i < nr_pages; i++)
+		order[i] = i;
+	if (random && order) {
+		for (i = nr_pages - 1; i; i--) {
+			size_t tmp;
+
+			j = next_random(&state) % (i + 1);
+			tmp = order[i];
+			order[i] = order[j];
+			order[j] = tmp;
+		}
+	}
+	for (round = 0; valid && round < 3; round++) {
+		valid = thp_pageout();
+		touches = 0;
+		start = monotonic_ns();
+		for (i = 0; valid && i < nr_pages; i++) {
+			j = order[i];
+			valid = pread(pagemap_fd, &entry, sizeof(entry),
+				((uintptr_t)data / page_size + j) * sizeof(entry)) ==
+				(ssize_t)sizeof(entry);
+			if (!valid)
+				break;
+			if (entry & PM_SWAP)
+				touches++;
+			for (word = 0; word < page_size / sizeof(*data); word++) {
+				uint64_t expected = pattern_word(COMPRESSIBLE, 0, j, word, &state);
+
+				valid &= data[j * page_size / sizeof(*data) + word] == expected;
+			}
+		}
+		ksft_print_msg("%s round=%u pages=%zu first_touches=%zu access_ns=%llu\n",
+			name, round + 1, nr_pages, touches,
+			(unsigned long long)(monotonic_ns() - start));
+		valid &= touches == nr_pages / (nohuge ? 1 : thp_pages);
+		valid &= !snapshot(after, &swapped, &resident) && !swapped && resident == nr_pages;
+		if (!nohuge)
+			valid &= compound_group(0);
+	}
+	free(order);
+	if (affinity)
+		valid &= !sched_setaffinity(0, sizeof(saved), &saved);
+	ksft_test_result(valid, "%s: %u-page folios, three full-data rounds\n", name, thp_pages);
+}
+
+/* Break a sibling PTE or VMA boundary before faulting the original group. */
+static void test_thp_partial(bool split)
+{
+	size_t swapped, resident;
+	bool valid = prepare_thp() && thp_pageout();
+
+	if (valid) {
+		if (split)
+			valid = !mprotect((char *)data + page_size, page_size, PROT_READ);
+		else
+			valid = !madvise((char *)data + page_size, page_size, MADV_DONTNEED);
+		valid &= __atomic_load_n(data, __ATOMIC_RELAXED) == UINT64_C(0x6d656d636f6d7000);
+		/* Only the faulting token can have become resident. */
+		if (split) {
+			valid &= !snapshot(after, &swapped, &resident) &&
+				swapped == nr_pages - 1 && resident == 1;
+			valid &= !mprotect((char *)data + page_size, page_size,
+					   PROT_READ | PROT_WRITE);
+		} else {
+			uint64_t state = 0;
+			size_t word;
+
+			for (word = 0; word < page_size / sizeof(*data); word++) {
+				valid &= data[page_size / sizeof(*data) + word] == 0;
+				data[page_size / sizeof(*data) + word] =
+					pattern_word(COMPRESSIBLE, 0, 1, word, &state);
+			}
+			valid &= !snapshot(after, &swapped, &resident) &&
+				swapped == nr_pages - 2 && resident == 2;
+		}
+		valid &= visit_data(COMPRESSIBLE, 0, false);
+	}
+	ksft_test_result(valid, "THP %s falls back without overwriting siblings\n",
+			split ? "VMA split" : "discarded sibling");
+}
+
+static pthread_barrier_t fault_barrier;
+static bool race_unmap;
+
+static void *thp_fault_thread(void *arg)
+{
+	uintptr_t index = (uintptr_t)arg;
+	size_t group;
+	uint64_t state = 0;
+	bool valid = true;
+
+	pthread_barrier_wait(&fault_barrier);
+	for (group = 0; group < nr_pages; group += thp_pages) {
+		size_t page = group + index % thp_pages;
+		uint64_t *ptr = data + page * page_size / sizeof(*data);
+
+		if (race_unmap && index == 1) {
+			void *addr = (void *)ptr;
+
+			/* Other threads access page 0 only; never touch an unmapped VA. */
+			valid &= !munmap(addr, page_size);
+			valid &= mmap(addr, page_size, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == addr;
+			if (valid)
+				*ptr = 0x12345678;
+		} else {
+			size_t word;
+
+			for (word = 0; word < page_size / sizeof(*data); word++)
+				valid &= ptr[word] == pattern_word(COMPRESSIBLE, 0,
+								 page, word, &state);
+		}
+	}
+	return (void *)(uintptr_t)!valid;
+}
+
+static void test_thp_race(bool unmap)
+{
+	pthread_t threads[4];
+	size_t page, word;
+	unsigned int round, i, count = unmap ? 2 : 4;
+	bool valid = true;
+	void *result;
+
+	race_unmap = unmap;
+	for (round = 0; valid && round < 4; round++) {
+		valid = prepare_thp() && thp_pageout();
+		if (!valid)
+			break;
+		pthread_barrier_init(&fault_barrier, NULL, count);
+		for (i = 0; i < count; i++)
+			if (pthread_create(&threads[i], NULL, thp_fault_thread,
+					   (void *)(uintptr_t)i))
+				ksft_exit_fail_msg("cannot create fault thread\n");
+		for (i = 0; i < count; i++) {
+			pthread_join(threads[i], &result);
+			valid &= !result;
+		}
+		pthread_barrier_destroy(&fault_barrier);
+		if (unmap) {
+			uint64_t state = 0, expected;
+
+			for (page = 0; page < nr_pages; page++) {
+				for (word = 0; word < page_size / sizeof(*data); word++) {
+					if (page % thp_pages == 1)
+						expected = word ? 0 : 0x12345678;
+					else
+						expected = pattern_word(COMPRESSIBLE, 0,
+								page, word, &state);
+					valid &= data[page * page_size / sizeof(*data) + word] ==
+						 expected;
+				}
+			}
+			/* Restore one VMA for the next controlled THP allocation. */
+			valid &= mmap(data, data_size, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void *)data;
+		} else {
+			valid &= visit_data(COMPRESSIBLE, 0, false);
+		}
+	}
+	ksft_test_result(valid, "THP concurrent %s preserves data (four rounds)\n",
+			unmap ? "fault/unmap/remap" : "sibling faults");
+}
+
+static void test_thp_uffd(void)
+{
+	struct uffdio_api api = { .api = UFFD_API };
+	struct uffdio_register reg = {
+		.range = { .start = (uintptr_t)data, .len = data_size },
+		.mode = UFFDIO_REGISTER_MODE_MISSING,
+	};
+	size_t swapped, resident;
+	bool valid = prepare_thp() && thp_pageout();
+	int fd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+
+	valid &= fd >= 0;
+	if (valid) {
+		valid = !ioctl(fd, UFFDIO_API, &api) && !ioctl(fd, UFFDIO_REGISTER, &reg);
+		valid &= __atomic_load_n(data, __ATOMIC_RELAXED) == UINT64_C(0x6d656d636f6d7000);
+		valid &= !snapshot(after, &swapped, &resident) &&
+			 resident == 1 && swapped == nr_pages - 1;
+		valid &= visit_data(COMPRESSIBLE, 0, false);
+	}
+	if (fd >= 0)
+		close(fd);
+	ksft_test_result(valid, "THP UFFD missing registration keeps per-page faults\n");
+}
+
+static bool self_setting(const char *path, const char *value)
+{
+	int fd = open(path, O_WRONLY);
+	bool valid;
+
+	if (fd < 0)
+		return false;
+	valid = write(fd, value, strlen(value)) == (ssize_t)strlen(value);
+	close(fd);
+	return valid;
+}
+
+static void test_thp_write(void)
+{
+	size_t swapped, resident, index = thp_pages / 2;
+	bool valid = prepare_thp() && thp_pageout();
+
+	/* First access is a write to a nonzero subpage of the compressed group. */
+	__atomic_store_n(data + index * page_size / sizeof(*data),
+			 UINT64_C(0x6d656d636f6d7000) ^ index ^ 1, __ATOMIC_RELAXED);
+	valid &= !snapshot(after, &swapped, &resident) && resident == thp_pages &&
+		 swapped == nr_pages - thp_pages;
+	valid &= data[index * page_size / sizeof(*data)] ==
+		 (UINT64_C(0x6d656d636f6d7000) ^ index ^ 1);
+	data[index * page_size / sizeof(*data)] ^= 1;
+	valid &= visit_data(COMPRESSIBLE, 0, false);
+	ksft_test_result(valid, "THP initial write fault targets the correct subpage\n");
+}
+
+static void test_thp_alloc_failure(void)
+{
+	size_t swapped, resident;
+	bool valid = prepare_thp() && thp_pageout();
+	FILE *file;
+	int remaining = -1;
+
+	/* The harness arms fail_page_alloc only for marked tasks and order > 0. */
+	valid &= self_setting("/proc/self/make-it-fail", "1");
+	valid &= __atomic_load_n(data, __ATOMIC_RELAXED) == UINT64_C(0x6d656d636f6d7000);
+	valid &= !snapshot(after, &swapped, &resident) &&
+		 resident == 1 && swapped == nr_pages - 1;
+	file = fopen("/sys/kernel/debug/fail_page_alloc/times", "r");
+	if (file) {
+		valid &= fscanf(file, "%d", &remaining) == 1 && remaining == 0;
+		fclose(file);
+	} else {
+		valid = false;
+	}
+	ksft_print_msg("THP fail_page_alloc: remaining=%d resident=%zu tokens=%zu\n",
+		       remaining, resident, swapped);
+	valid &= visit_data(COMPRESSIBLE, 0, false);
+	valid &= self_setting("/proc/self/make-it-fail", "0");
+	valid &= !snapshot(after, &swapped, &resident) && !swapped && resident == nr_pages;
+	ksft_test_result(valid, "THP allocation failure falls back to base pages\n");
+}
+
 static void usage(const char *program)
 {
-	printf("Usage: %s [--token-type N] [--strict-rollback] [--strict-smaps] [--help]\n",
+	printf("Usage: %s [--token-type N] [--strict-rollback] [--strict-smaps]\n"
+	       "       [--thp-pages 4|8|16] [--thp-fail-alloc] [--help]\n",
 	       program);
+	printf("  --thp-pages N      Add THP tests; requires matching mTHP sysfs policy.\n");
+	printf("  --thp-fail-alloc   Requires task-filtered order>0 fail_page_alloc setup.\n");
 	printf("Default: check data and COW; report PTE and smaps behavior.\n");
 	printf("  --token-type N     Expected pagemap swap type, 0..31 (default 27).\n");
 	printf("  --strict-rollback  Require rejected pages to remain resident.\n");
@@ -468,7 +814,7 @@ static void usage(const char *program)
 	printf("For other CONFIG settings, verify the type and override it.\n");
 	printf("Tokens include PENDING pages and do not prove codec completion.\n");
 	printf("Requires no configured swap; changes no global tunables.\n");
-	printf("Data: 2 MiB (4 MiB with fork COW); timeout: 45 seconds.\n");
+	printf("Data: 2 MiB, or 8 MiB with THP tests; fork doubles this; timeout: 45/180s.\n");
 }
 
 static bool parse_token_type(const char *value)
@@ -497,7 +843,16 @@ int main(int argc, char **argv)
 			strict_rollback = true;
 		else if (!strcmp(argv[argument], "--strict-smaps"))
 			strict_smaps = true;
-		else if (!strcmp(argv[argument], "--token-type")) {
+		else if (!strcmp(argv[argument], "--thp-fail-alloc"))
+			thp_fail_alloc = true;
+		else if (!strcmp(argv[argument], "--thp-pages")) {
+			if (++argument == argc ||
+			    (strcmp(argv[argument], "4") && strcmp(argv[argument], "8") &&
+			     strcmp(argv[argument], "16")))
+				ksft_exit_fail_msg("--thp-pages requires 4, 8 or 16\n");
+			thp_pages = atoi(argv[argument]);
+			data_size = 8UL * 1024 * 1024;
+		} else if (!strcmp(argv[argument], "--token-type")) {
 			if (++argument == argc || !parse_token_type(argv[argument])) {
 				usage(argv[0]);
 				return KSFT_FAIL;
@@ -507,6 +862,8 @@ int main(int argc, char **argv)
 			return !strcmp(argv[argument], "--help") ? KSFT_PASS : KSFT_FAIL;
 		}
 	}
+	if (thp_fail_alloc && !thp_pages)
+		ksft_exit_fail_msg("--thp-fail-alloc requires --thp-pages\n");
 	ksft_print_header();
 	if (access("/sys/kernel/mm/memcompress/stat", R_OK))
 		ksft_exit_skip("memcompress sysfs is unavailable\n");
@@ -524,7 +881,7 @@ int main(int argc, char **argv)
 	page_size = sysconf(_SC_PAGESIZE);
 	if (page_size != 4096)
 		ksft_exit_skip("memcompress tests require 4 KiB pages\n");
-	nr_pages = DATA_SIZE / page_size;
+	nr_pages = data_size / page_size;
 	pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
 	if (pagemap_fd < 0)
 		ksft_exit_skip("pagemap is unavailable\n");
@@ -533,24 +890,41 @@ int main(int argc, char **argv)
 	if (!before || !after)
 		ksft_exit_fail_msg("cannot allocate pagemap snapshots\n");
 	/* Guard VMAs prevent merging, making the smaps measurement unambiguous. */
-	mapping_size = DATA_SIZE + 2 * page_size;
+	mapping_size = data_size + 2 * THP_ALIGN;
 	mapping = mmap(NULL, mapping_size, PROT_NONE,
 		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (mapping == MAP_FAILED)
 		ksft_exit_fail_msg("mmap failed\n");
-	data = (void *)((char *)mapping + page_size);
-	if (mprotect(data, DATA_SIZE, PROT_READ | PROT_WRITE) ||
-	    madvise(data, DATA_SIZE, MADV_NOHUGEPAGE))
+	data = (void *)(((uintptr_t)mapping + THP_ALIGN) & ~(THP_ALIGN - 1));
+	if (mprotect(data, data_size, PROT_READ | PROT_WRITE) ||
+	    madvise(data, data_size, MADV_NOHUGEPAGE))
 		ksft_exit_skip("cannot prepare isolated base-page mapping\n");
 	signal(SIGALRM, timeout_handler);
 	signal(SIGPIPE, SIG_IGN);
-	alarm(45);
-	ksft_set_plan(TEST_COUNT);
+	alarm(thp_pages ? 180 : 45);
+	ksft_set_plan(TEST_COUNT + (thp_pages ? 10 : 0) + thp_fail_alloc);
 	test_roundtrip(SAMEFILL, "same-filled page roundtrip");
 	test_roundtrip(COMPRESSIBLE, "compressible payload roundtrip");
 	test_fork_cow();
 	test_smaps();
 	test_rejected_pages();
+	if (thp_pages) {
+		test_thp_access(false, false);
+		test_thp_access(true, false);
+		test_thp_access(false, true);
+		test_thp_partial(false);
+		test_thp_partial(true);
+		if (!prepare_thp())
+			ksft_test_result_fail("cannot prepare THP fork mapping\n");
+		else
+			test_fork_cow();
+		test_thp_race(false);
+		test_thp_race(true);
+		test_thp_uffd();
+		test_thp_write();
+		if (thp_fail_alloc)
+			test_thp_alloc_failure();
+	}
 	alarm(0);
 	munmap(mapping, mapping_size);
 	free(before);

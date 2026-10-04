@@ -79,6 +79,11 @@ unsigned int memcompress_pte_batch(pte_t *ptep, unsigned int max_nr);
 
 int memcompress_do_load_entry(struct memcompress_entry *entry, void *dst);
 int memcompress_load_folio(struct memcompress_entry *entry, struct folio *folio);
+/* On failure only the caller's original entry pin remains owned. */
+bool memcompress_load_group_pin(struct memcompress_entry *entry,
+		struct memcompress_entry **entries, unsigned int nr_pages);
+int memcompress_load_group(struct memcompress_entry **entries,
+			   struct folio *folio);
 int memcompress_read_token(unsigned long token, struct folio *folio);
 struct folio *memcompress_pending_folio(struct memcompress_entry *entry,
 				      unsigned int *page_idx);
@@ -198,6 +203,16 @@ memcompress_pending_folio_valid(struct memcompress_entry *entry,
 }
 static inline int memcompress_load_folio(struct memcompress_entry *entry,
 				       struct folio *folio)
+{
+	return -ENOENT;
+}
+static inline bool memcompress_load_group_pin(struct memcompress_entry *entry,
+		struct memcompress_entry **entries, unsigned int nr_pages)
+{
+	return false;
+}
+static inline int memcompress_load_group(struct memcompress_entry **entries,
+					struct folio *folio)
 {
 	return -ENOENT;
 }
