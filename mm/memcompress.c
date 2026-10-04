@@ -1380,6 +1380,11 @@ static void __init memcompress_choose_compressor(void)
 
 	if (memcompress_compressor_user_set)
 		return;
+	/* Prefer upstream zstd independently of the boot-time CPU topology. */
+	if (crypto_has_comp("zstd", 0, 0)) {
+		strscpy(memcompress_compressor, "zstd", sizeof(memcompress_compressor));
+		return;
+	}
 	cpus_read_lock();
 	for_each_online_cpu(cpu) {
 		unsigned long capacity = 0;

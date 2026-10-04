@@ -9,6 +9,28 @@ the displaced mappings with reserved swap-type tokens. It needs the swap
 infrastructure enabled by CONFIG_SWAP; an active ordinary swap device is
 not required for this RAM-backed path.
 
+Compressor selection
+====================
+
+The native port prefers the standard ``zstd`` crypto compressor when available,
+independent of CPU topology. CONFIG_MEMCOMPRESS selects CONFIG_CRYPTO_ZSTD.
+An explicit boot parameter, such as ``memcompress.compressor=lz4``, takes
+precedence. If standard zstd is unavailable, the previous CPU-capacity selector
+remains the fallback: a gap below ``memcompress.capacity_threshold`` selects
+lz4; otherwise it tries zstdp and then zstd. An unavailable explicitly selected
+codec causes backend initialization to fail rather than silently changing it.
+
+This default is a native policy choice. The examined vendor kernel uses a
+capacity-based selector and runs ``zstdp``, which is not the standard zstd codec.
+The change does not establish equivalent compression speed or memory savings.
+Direct reclaim and its codec-dependent classifier retain their existing policy.
+
+The selected codec can be read from ``/sys/kernel/mm/memcompress/compressor``.
+It is fixed during backend initialization; compressed entries share that codec
+and cannot switch algorithms at runtime. Changing the default requires booting
+the rebuilt kernel, or using an explicit compressor boot parameter. Changing
+the capacity threshold after initialization does not reselect the compressor.
+
 Execution and ownership
 =======================
 
