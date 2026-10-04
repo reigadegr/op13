@@ -124,6 +124,29 @@ separate work. Virtual-machine tests can validate execution and data integrity;
 phone latency, energy use, memory-hotplug failure paths and vendor/native
 performance equivalence require their own measurements.
 
+Device validation scope
+========================
+
+The companion memc report ``results/native-lz4-20261004-g97590af7a41f`` records
+a phone running 6.6.118-4k-g97590af7a41f with lz4 and no ordinary swap. The
+same binaries and parameters as the vendor baseline passed five functional
+tests and verified 216 MiB. Incompressible-data cases retained resident pages
+and correctly skipped token-fault performance measurements.
+
+Two separate 768 MiB allocation workloads exercised all seven workers,
+including the burst worker. Both verified their data, with no observed direct
+scan or allocation-stall counter increase. The test mappings remained resident;
+worker activity and global reclaim do not prove those mappings were compressed.
+System-server CPU varied during and after the workloads, without evidence
+establishing direct compression as the cause. These observations do not justify
+disabling direct reclaim or its classifier. The vendor baseline has no matching
+background-allocation workload for a performance comparison.
+
+The later zstd default passed an Image/BTF build and an eight-CPU QEMU run,
+recorded in ``results/zstd-default-20261004`` in the companion checkout. It has
+not yet been tested on the phone. Keep these codec and validation scopes
+separate when interpreting results.
+
 Reproducing the QEMU functional checks
 =====================================
 
