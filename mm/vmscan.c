@@ -58,6 +58,7 @@
 #include <linux/rculist_nulls.h>
 #include <linux/random.h>
 #include <linux/memcompress.h>
+#include <linux/kfifo.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -185,6 +186,16 @@ struct scan_control {
 	/* for recording the reclaimed slab by now */
 	struct reclaim_state reclaim_state;
 	ANDROID_VENDOR_DATA(1);
+
+	/* Direct feedback persists across priorities in try_to_free_pages(). */
+	unsigned long memcompress_direct_reject_pages;
+	u64 memcompress_direct_progress_cursor;
+	unsigned int memcompress_direct_reject_run;
+	int memcompress_direct_nid;
+	bool memcompress_direct_feedback_enabled;
+	bool memcompress_direct_anon_stalled;
+	bool memcompress_direct_feedback_done;
+	bool memcompress_direct_feedback_progress;
 };
 
 #ifdef ARCH_HAS_PREFETCHW
@@ -535,6 +546,76 @@ static int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)
 }
 #endif
 
+static bool memcompress_direct_feedback_allowed(struct scan_control *sc)
+{
+	return sc->memcompress_direct_feedback_enabled &&
+		!sc->memcompress_direct_feedback_done && !sc->order &&
+		!cgroup_reclaim(sc) && !sc->proactive && !sc->hibernation_mode &&
+		current->reclaim_state && !current_is_kswapd() &&
+		!(current->flags & (PF_USER_WORKER | PF_LOCAL_THROTTLE | PF_KTHREAD)) &&
+		!fatal_signal_pending(current);
+}
+
+static bool memcompress_direct_precheck(struct scan_control *sc,
+		struct folio *folio, unsigned int nr_pages,
+		enum memcompress_reclaim_source source)
+{
+	bool fresh = memcompress_fresh_reservation(folio);
+	bool feedback = fresh && memcompress_direct_feedback_allowed(sc);
+
+	/* Existing reservations must still be allowed to finish. */
+	if (fresh && sc->memcompress_direct_anon_stalled)
+		return false;
+
+	if (memcompress_reclaim_ctx_precheck(nr_pages, source)) {
+		if (feedback) {
+			sc->memcompress_direct_reject_run = 0;
+			sc->memcompress_direct_reject_pages = 0;
+		}
+		return true;
+	}
+
+	/* Only context contention counts, not reservation or codec failures. */
+	if (feedback) {
+		if (!sc->memcompress_direct_reject_run)
+			sc->memcompress_direct_progress_cursor =
+				memcompress_reclaim_progress(sc->memcompress_direct_nid);
+		sc->memcompress_direct_reject_run++;
+		sc->memcompress_direct_reject_pages +=
+			min_t(unsigned long, nr_pages,
+			      ULONG_MAX - sc->memcompress_direct_reject_pages);
+		if (sc->memcompress_direct_reject_run >= 8 ||
+		    sc->memcompress_direct_reject_pages >= 32)
+			sc->memcompress_direct_anon_stalled = true;
+	}
+	return false;
+}
+
+static void memcompress_direct_feedback(struct scan_control *sc)
+{
+	u64 cursor;
+	int nid;
+
+	if (!sc->memcompress_direct_anon_stalled)
+		return;
+	sc->memcompress_direct_anon_stalled = false;
+	if (!memcompress_direct_feedback_allowed(sc))
+		return;
+
+	/* At most one bounded wait per allocation's direct reclaim attempt. */
+	sc->memcompress_direct_feedback_done = true;
+	cursor = sc->memcompress_direct_progress_cursor;
+	nid = sc->memcompress_direct_nid;
+	if (memcompress_reclaim_progress(nid) == cursor &&
+	    sc->nr_reclaimed < sc->nr_to_reclaim &&
+	    memcompress_reclaim_inflight(nid))
+		memcompress_wait_reclaim_progress(nid, cursor, 1);
+
+	/* Draining failed work also wakes waiters but is not progress. */
+	if (memcompress_reclaim_progress(nid) != cursor)
+		sc->memcompress_direct_feedback_progress = true;
+}
+
 static void set_task_reclaim_state(struct task_struct *task,
 				   struct reclaim_state *rs)
 {
@@ -636,7 +717,8 @@ static inline bool can_reclaim_anon_pages(struct mem_cgroup *memcg,
 					  int nid,
 					  struct scan_control *sc)
 {
-	if (memcompress_available())
+	if (memcompress_available() &&
+	    (!sc || !sc->memcompress_direct_anon_stalled))
 		return true;
 	if (memcg == NULL) {
 		/*
@@ -1333,6 +1415,22 @@ void __acct_reclaim_writeback(pg_data_t *pgdat, struct folio *folio,
 		wake_up(&pgdat->reclaim_wait[VMSCAN_THROTTLE_WRITEBACK]);
 }
 
+enum kreclaimd_work_type {
+	KRECLAIMD_WORK_WRITEPAGE,
+	KRECLAIMD_WORK_MEMCOMPRESS,
+};
+
+#ifdef CONFIG_MEMCOMPRESS
+static bool kreclaimd_queue_work(struct folio *folio,
+				enum kreclaimd_work_type type);
+#else
+static bool kreclaimd_queue_work(struct folio *folio,
+				enum kreclaimd_work_type type)
+{
+	return false;
+}
+#endif
+
 /* possible outcome of pageout() */
 typedef enum {
 	/* failed to write folio out, folio is locked */
@@ -1343,6 +1441,8 @@ typedef enum {
 	PAGE_SUCCESS,
 	/* folio is clean and locked */
 	PAGE_CLEAN,
+	/* worker owns the lock and a reference; caller retains LRU ownership */
+	PAGE_QUEUED,
 } pageout_t;
 
 /*
@@ -1399,6 +1499,9 @@ static pageout_t pageout(struct folio *folio, struct address_space *mapping,
 		};
 
 		folio_set_reclaim(folio);
+		if ((folio_test_anon(folio) || !folio_test_swapbacked(folio)) &&
+		    kreclaimd_queue_work(folio, KRECLAIMD_WORK_WRITEPAGE))
+			return PAGE_QUEUED;
 		res = mapping->a_ops->writepage(&folio->page, &wbc);
 		if (res < 0)
 			handle_write_error(mapping, folio, res);
@@ -1774,6 +1877,492 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 	return !data_race(folio_swap_flags(folio) & SWP_FS_OPS);
 }
 
+struct kreclaimd_feedback {
+	struct kreclaimd_node *ctx;
+	u64 cursor;
+	unsigned int waits;
+};
+
+static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx);
+
+#ifdef CONFIG_MEMCOMPRESS
+#define KRECLAIMD_QUEUE_SIZE	1024
+#define KRECLAIMD_BATCH_SIZE	8
+#define KRECLAIMD_BURST_THRESHOLD 512
+#define KRECLAIMD_THROTTLE_THRESHOLD 768
+#define KRECLAIMD_THROTTLE_BATCH	64
+
+struct kreclaimd_work {
+	struct folio *folio;
+	enum kreclaimd_work_type type;
+};
+
+struct kreclaimd_worker {
+	struct task_struct *task;
+	struct kreclaimd_node *ctx;
+	struct completion started;
+	bool burst;
+};
+
+struct kreclaimd_node {
+	struct pglist_data *pgdat;
+	spinlock_t lock;
+	DECLARE_KFIFO_PTR(fifo, struct kreclaimd_work);
+	wait_queue_head_t work_wait;
+	wait_queue_head_t burst_wait;
+	wait_queue_head_t throttle_wait;
+	wait_queue_head_t feedback_wait;
+	atomic_long_t inflight;
+	atomic64_t completed;
+	long feedback_floor;
+	unsigned int throttle_target;
+	unsigned int queued;
+	unsigned int nr_workers;
+	bool has_burst;
+	bool burst_requested;
+	bool burst_active;
+	bool throttled;
+	bool stopping;
+	struct kreclaimd_worker workers[];
+};
+
+/* Only the node's kswapd uses a published context; stop joins it first. */
+static struct kreclaimd_node *kreclaimd_nodes[MAX_NUMNODES];
+
+static struct kreclaimd_node *kreclaimd_context(pg_data_t *pgdat)
+{
+	if (current != READ_ONCE(pgdat->kswapd))
+		return NULL;
+	/* Pairs with publication after all workers and waitqueues are ready. */
+	return smp_load_acquire(&kreclaimd_nodes[pgdat->node_id]);
+}
+
+/*
+ * Compression transfers the locked folio and isolation reference. Writepage
+ * transfers the lock with an extra reference; the caller retains LRU ownership.
+ * On rejection the caller retains everything and can reclaim synchronously.
+ */
+static bool kreclaimd_queue_work(struct folio *folio,
+				enum kreclaimd_work_type type)
+{
+	struct kreclaimd_node *ctx = kreclaimd_context(folio_pgdat(folio));
+	struct kreclaimd_work work = { .folio = folio, .type = type };
+	unsigned long flags;
+	bool burst = false, queued = false;
+
+	if (!ctx)
+		return false;
+	if (WARN_ON_ONCE(!folio_test_locked(folio)))
+		return false;
+	if (type == KRECLAIMD_WORK_MEMCOMPRESS && folio_test_large(folio)) {
+		/* The deferred-split scanner can remove this folio concurrently. */
+		if (data_race(!list_empty(&folio->_deferred_list)))
+			return false;
+	}
+	if (type == KRECLAIMD_WORK_WRITEPAGE)
+		folio_get(folio);
+	spin_lock_irqsave(&ctx->lock, flags);
+	if (!ctx->stopping && kfifo_put(&ctx->fifo, work)) {
+		WRITE_ONCE(ctx->queued, kfifo_len(&ctx->fifo));
+		/* Publish accounting before a worker can remove this item. */
+		if (type == KRECLAIMD_WORK_MEMCOMPRESS) {
+			unsigned int nr_pages = folio_nr_pages(folio);
+
+			atomic_long_add(nr_pages, &ctx->inflight);
+			memcompress_reclaim_queue(ctx->pgdat->node_id, nr_pages);
+		}
+		if (ctx->has_burst && !ctx->burst_requested &&
+		    kfifo_len(&ctx->fifo) >= KRECLAIMD_BURST_THRESHOLD) {
+			ctx->burst_requested = true;
+			burst = !ctx->burst_active;
+		}
+		queued = true;
+	}
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	if (queued) {
+		/* Ordinary waits are nonexclusive, as in the vendor path. */
+		wake_up(&ctx->work_wait);
+		if (burst)
+			wake_up(&ctx->burst_wait);
+	} else if (type == KRECLAIMD_WORK_WRITEPAGE) {
+		folio_put(folio);
+	}
+	return queued;
+}
+
+static void kreclaimd_writepage(struct folio *folio)
+{
+	struct address_space *mapping = folio_mapping(folio);
+	struct writeback_control wbc = {
+		.sync_mode = WB_SYNC_NONE,
+		.nr_to_write = SWAP_CLUSTER_MAX,
+		.range_start = 0,
+		.range_end = LLONG_MAX,
+		.for_reclaim = 1,
+	};
+	int ret;
+
+	/* Never retain the submitting task's stack-backed swap plug. */
+	if (!mapping || !mapping->a_ops->writepage) {
+		folio_mark_dirty(folio);
+		folio_clear_reclaim(folio);
+		folio_unlock(folio);
+		goto out;
+	}
+	ret = mapping->a_ops->writepage(&folio->page, &wbc);
+	if (ret < 0)
+		handle_write_error(mapping, folio, ret);
+	if (ret == AOP_WRITEPAGE_ACTIVATE) {
+		folio_clear_reclaim(folio);
+		folio_activate(folio);
+		folio_unlock(folio);
+		goto out;
+	}
+	if (!folio_test_writeback(folio))
+		folio_clear_reclaim(folio);
+	trace_mm_vmscan_write_folio(folio);
+	node_stat_add_folio(folio, NR_VMSCAN_WRITE);
+out:
+	folio_put(folio);
+}
+
+static bool kreclaimd_compress(struct folio *folio,
+			      enum memcompress_reclaim_source source,
+			      struct list_head *free_folios)
+{
+	struct memcompress_reclaim_ctx *codec = NULL;
+	struct anon_vma *anon_vma = NULL;
+	unsigned int nr_pages = folio_nr_pages(folio);
+	enum ttu_flags flags = TTU_BATCH_FLUSH;
+	bool reserved = false;
+
+	if (!folio_evictable(folio) || folio_maybe_dma_pinned(folio) ||
+	    !memcompress_reserve_eligible(folio))
+		goto keep;
+	codec = memcompress_reclaim_ctx_get(nr_pages, source);
+	if (!codec)
+		goto keep;
+	/* Failed stores need this rmap even after the last present PTE is gone. */
+	anon_vma = folio_get_anon_vma(folio);
+	if (!anon_vma || !memcompress_reserve(folio, NULL))
+		goto keep;
+	reserved = true;
+	if (folio_test_large(folio))
+		flags |= TTU_SYNC;
+	if (folio_test_pmd_mappable(folio))
+		flags |= TTU_SPLIT_HUGE_PMD;
+	try_to_unmap(folio, flags);
+	try_to_unmap_flush();
+	if (folio_mapped(folio) || folio_maybe_dma_pinned(folio) ||
+	    !memcompress_store_after_unmap(folio, &codec))
+		goto keep;
+	if (!folio_ref_freeze(folio, 1))
+		goto keep;
+	put_anon_vma(anon_vma);
+	folio_clear_dirty(folio);
+	folio_clear_reclaim(folio);
+	folio_unlock(folio);
+	count_vm_events(PGSTEAL_KSWAPD, nr_pages);
+	count_vm_events(PGSTEAL_ANON, nr_pages);
+	count_memcg_folio_events(folio, PGSTEAL_KSWAPD, nr_pages);
+	count_memcg_folio_events(folio, PGSTEAL_ANON, nr_pages);
+	if (folio_test_large(folio))
+		destroy_large_folio(folio);
+	else
+		list_add(&folio->lru, free_folios);
+	return true;
+keep:
+	if (reserved)
+		memcompress_rollback_folio(folio);
+	if (anon_vma)
+		put_anon_vma(anon_vma);
+	memcompress_reclaim_ctx_put(codec);
+	folio_clear_reclaim(folio);
+	folio_unlock(folio);
+	/* Drops the transferred isolation reference, including unevictable pages. */
+	folio_putback_lru(folio);
+	return false;
+}
+
+static void kreclaimd_complete(struct kreclaimd_node *ctx,
+			       unsigned int nr_pages, bool success)
+{
+	long remaining;
+
+	if (success) {
+		atomic64_add(nr_pages, &ctx->completed);
+		WRITE_ONCE(ctx->pgdat->kswapd_failures, 0);
+	}
+	memcompress_reclaim_complete(ctx->pgdat->node_id, nr_pages, success);
+	remaining = atomic_long_sub_return(nr_pages, &ctx->inflight);
+	WARN_ON_ONCE(remaining < 0);
+	if (success || remaining <= READ_ONCE(ctx->feedback_floor))
+		wake_up(&ctx->feedback_wait);
+}
+
+static int kreclaimd_worker(void *arg)
+{
+	struct kreclaimd_worker *worker = arg;
+	struct kreclaimd_node *ctx = worker->ctx;
+	struct kreclaimd_work work[KRECLAIMD_BATCH_SIZE];
+	enum memcompress_reclaim_source source = worker->burst ?
+		MEMCOMPRESS_RECLAIM_BURST : MEMCOMPRESS_RECLAIM_WORKER;
+
+	if (!cpumask_empty(cpu_online_mask))
+		set_cpus_allowed_ptr(current, cpu_online_mask);
+	complete(&worker->started);
+	for (;;) {
+		unsigned int nr, i;
+		unsigned long flags, saved_flags;
+		bool stop;
+		LIST_HEAD(free_folios);
+
+		if (worker->burst) {
+			wait_event(ctx->burst_wait,
+				   READ_ONCE(ctx->burst_requested) ||
+				   READ_ONCE(ctx->stopping));
+			spin_lock_irqsave(&ctx->lock, flags);
+			ctx->burst_requested = false;
+			ctx->burst_active = true;
+			spin_unlock_irqrestore(&ctx->lock, flags);
+		} else {
+			wait_event(ctx->work_wait, READ_ONCE(ctx->queued) ||
+				   READ_ONCE(ctx->stopping));
+		}
+
+		/* Drain each activation, including all queued ownership on stop. */
+		for (;;) {
+			spin_lock_irqsave(&ctx->lock, flags);
+			nr = kfifo_out(&ctx->fifo, work, ARRAY_SIZE(work));
+			WRITE_ONCE(ctx->queued, kfifo_len(&ctx->fifo));
+			stop = ctx->stopping;
+			if (!nr && worker->burst) {
+				ctx->burst_active = false;
+				ctx->burst_requested = false;
+			}
+			if (ctx->throttled &&
+			    kfifo_len(&ctx->fifo) <= ctx->throttle_target)
+				wake_up(&ctx->throttle_wait);
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			if (!nr)
+				break;
+
+			saved_flags = current->flags & (PF_MEMALLOC | PF_KSWAPD);
+			current->flags |= PF_MEMALLOC | PF_KSWAPD;
+			for (i = 0; i < nr; i++) {
+				struct folio *folio = work[i].folio;
+				unsigned int nr_pages = folio_nr_pages(folio);
+				bool success;
+
+				if (work[i].type == KRECLAIMD_WORK_WRITEPAGE) {
+					kreclaimd_writepage(folio);
+					continue;
+				}
+				success = kreclaimd_compress(folio, source, &free_folios);
+				kreclaimd_complete(ctx, nr_pages, success);
+			}
+			mem_cgroup_uncharge_list(&free_folios);
+			try_to_unmap_flush();
+			free_unref_page_list(&free_folios);
+			current->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
+			current->flags |= saved_flags;
+			cond_resched();
+		}
+		if (stop)
+			break;
+	}
+	return 0;
+}
+
+static void kreclaimd_throttle(pg_data_t *pgdat, struct scan_control *sc)
+{
+	struct kreclaimd_node *ctx = kreclaimd_context(pgdat);
+	unsigned int target;
+
+	if (!ctx || READ_ONCE(ctx->queued) < KRECLAIMD_THROTTLE_THRESHOLD)
+		return;
+	spin_lock_irq(&ctx->lock);
+	if (ctx->queued < KRECLAIMD_THROTTLE_THRESHOLD || ctx->stopping) {
+		spin_unlock_irq(&ctx->lock);
+		return;
+	}
+	target = ctx->queued - KRECLAIMD_THROTTLE_BATCH;
+	ctx->throttle_target = target;
+	ctx->throttled = true;
+	spin_unlock_irq(&ctx->lock);
+	wait_event_timeout(ctx->throttle_wait,
+		READ_ONCE(ctx->queued) <= target || READ_ONCE(ctx->stopping) ||
+		pgdat_balanced(pgdat, sc->order, sc->reclaim_idx) ||
+		kthread_should_stop() || freezing(current), 1);
+	spin_lock_irq(&ctx->lock);
+	ctx->throttled = false;
+	spin_unlock_irq(&ctx->lock);
+}
+
+static void kreclaimd_feedback_init(pg_data_t *pgdat,
+				    struct kreclaimd_feedback *feedback)
+{
+	feedback->ctx = kreclaimd_context(pgdat);
+	if (feedback->ctx)
+		feedback->cursor = atomic64_read(&feedback->ctx->completed);
+}
+
+static void kreclaimd_collect(struct kreclaimd_feedback *feedback,
+			      struct scan_control *sc)
+{
+	u64 completed;
+
+	if (!feedback->ctx)
+		return;
+	completed = atomic64_read(&feedback->ctx->completed);
+	/* Only this balance_pgdat invocation consumes its cursor. */
+	sc->nr_reclaimed += completed - feedback->cursor;
+	feedback->cursor = completed;
+}
+
+static void kreclaimd_feedback_wait(struct kreclaimd_feedback *feedback,
+				    struct scan_control *sc,
+				    unsigned long reclaimed)
+{
+	struct kreclaimd_node *ctx = feedback->ctx;
+	unsigned long target;
+	long inflight, floor;
+	u64 cursor;
+
+	if (!ctx)
+		return;
+	kreclaimd_collect(feedback, sc);
+	if (feedback->waits >= 3 || READ_ONCE(ctx->stopping) ||
+	    kthread_should_stop() || freezing(current) ||
+	    pgdat_balanced(ctx->pgdat, sc->order, sc->reclaim_idx))
+		return;
+	reclaimed = sc->nr_reclaimed - reclaimed;
+	if (reclaimed >= sc->nr_to_reclaim)
+		return;
+	target = min(sc->nr_to_reclaim - reclaimed, SWAP_CLUSTER_MAX);
+	inflight = atomic_long_read(&ctx->inflight);
+	cursor = feedback->cursor;
+	if (!target || inflight <= 0 || (unsigned long)inflight < target ||
+	    atomic64_read(&ctx->completed) != cursor)
+		goto collect;
+	floor = inflight - target;
+	WRITE_ONCE(ctx->feedback_floor, floor);
+	feedback->waits++;
+	wait_event_timeout(ctx->feedback_wait,
+		atomic64_read(&ctx->completed) - cursor >= target ||
+		atomic_long_read(&ctx->inflight) <= floor ||
+		READ_ONCE(ctx->stopping) ||
+		pgdat_balanced(ctx->pgdat, sc->order, sc->reclaim_idx) ||
+		kthread_should_stop() || freezing(current), 1);
+	WRITE_ONCE(ctx->feedback_floor, -1);
+collect:
+	/* Failed work draining to the floor releases the wait, adding no pages. */
+	kreclaimd_collect(feedback, sc);
+}
+
+static void __meminit kreclaimd_stop(pg_data_t *pgdat)
+{
+	struct kreclaimd_node *ctx = kreclaimd_nodes[pgdat->node_id];
+	unsigned int i;
+
+	if (!ctx)
+		return;
+	/* The producer is already stopped; workers must finish their batches. */
+	spin_lock_irq(&ctx->lock);
+	ctx->stopping = true;
+	spin_unlock_irq(&ctx->lock);
+	wake_up_all(&ctx->work_wait);
+	wake_up_all(&ctx->burst_wait);
+	wake_up_all(&ctx->throttle_wait);
+	wake_up_all(&ctx->feedback_wait);
+	for (i = ctx->nr_workers; i; i--)
+		kthread_stop_put(ctx->workers[i - 1].task);
+	WARN_ON_ONCE(!kfifo_is_empty(&ctx->fifo));
+	WARN_ON_ONCE(atomic_long_read(&ctx->inflight));
+	WRITE_ONCE(kreclaimd_nodes[pgdat->node_id], NULL);
+	kfifo_free(&ctx->fifo);
+	kfree(ctx);
+}
+
+static void __meminit kreclaimd_run(pg_data_t *pgdat)
+{
+	struct kreclaimd_node *ctx;
+	unsigned int online = num_online_cpus();
+	unsigned int nr_workers = max(online, 2U) - 1;
+	unsigned int nr_regular = max(online, 3U) - 2;
+	unsigned int i;
+
+	if (kreclaimd_nodes[pgdat->node_id])
+		return;
+	ctx = kzalloc(struct_size(ctx, workers, nr_workers), GFP_KERNEL);
+	if (!ctx)
+		return;
+	if (kfifo_alloc(&ctx->fifo, KRECLAIMD_QUEUE_SIZE, GFP_KERNEL)) {
+		kfree(ctx);
+		return;
+	}
+	ctx->pgdat = pgdat;
+	ctx->nr_workers = nr_workers;
+	ctx->has_burst = nr_workers > nr_regular;
+	ctx->feedback_floor = -1;
+	spin_lock_init(&ctx->lock);
+	init_waitqueue_head(&ctx->work_wait);
+	init_waitqueue_head(&ctx->burst_wait);
+	init_waitqueue_head(&ctx->throttle_wait);
+	init_waitqueue_head(&ctx->feedback_wait);
+	atomic_long_set(&ctx->inflight, 0);
+	atomic64_set(&ctx->completed, 0);
+	for (i = 0; i < nr_workers; i++) {
+		struct kreclaimd_worker *worker = &ctx->workers[i];
+
+		worker->ctx = ctx;
+		init_completion(&worker->started);
+		worker->burst = i >= nr_regular;
+		worker->task = kthread_create(kreclaimd_worker, worker,
+					      "kreclaimd%d/%u", pgdat->node_id, i);
+		if (IS_ERR(worker->task))
+			goto fail;
+		/* A drained worker may exit before its turn to be joined. */
+		get_task_struct(worker->task);
+	}
+	for (i = 0; i < nr_workers; i++)
+		wake_up_process(ctx->workers[i].task);
+	/* Stop must not skip threadfn after work has already been admitted. */
+	for (i = 0; i < nr_workers; i++)
+		wait_for_completion(&ctx->workers[i].started);
+	/* Publish only after every worker can drain transferred ownership. */
+	smp_store_release(&kreclaimd_nodes[pgdat->node_id], ctx);
+	return;
+fail:
+	WRITE_ONCE(ctx->stopping, true);
+	while (i)
+		kthread_stop_put(ctx->workers[--i].task);
+	kfifo_free(&ctx->fifo);
+	kfree(ctx);
+	pr_warn("Failed to start kreclaimd on node %d; using synchronous reclaim\n",
+		pgdat->node_id);
+}
+#else
+static void kreclaimd_run(pg_data_t *pgdat) { }
+static void kreclaimd_stop(pg_data_t *pgdat) { }
+static void kreclaimd_throttle(pg_data_t *pgdat, struct scan_control *sc)
+{
+}
+static void kreclaimd_feedback_init(pg_data_t *pgdat,
+				    struct kreclaimd_feedback *feedback)
+{
+}
+static void kreclaimd_collect(struct kreclaimd_feedback *feedback,
+			      struct scan_control *sc)
+{
+}
+static void kreclaimd_feedback_wait(struct kreclaimd_feedback *feedback,
+				    struct scan_control *sc,
+				    unsigned long reclaimed)
+{
+}
+#endif
+
 /*
  * shrink_folio_list() returns the number of reclaimed pages
  */
@@ -1808,6 +2397,7 @@ retry:
 		struct anon_vma *memcompress_anon_vma = NULL;
 
 		cond_resched();
+		kreclaimd_throttle(pgdat, sc);
 
 		folio = lru_to_folio(folio_list);
 		list_del(&folio->lru);
@@ -1990,7 +2580,11 @@ retry:
 						current_is_kswapd() ? MEMCOMPRESS_RECLAIM_KSWAPD :
 						MEMCOMPRESS_RECLAIM_DIRECT;
 
-					if (memcompress_reclaim_ctx_precheck(nr_pages, source))
+					/* Transfer the lock and isolation reference together. */
+					if (kreclaimd_queue_work(folio, KRECLAIMD_WORK_MEMCOMPRESS))
+						continue;
+					if (memcompress_direct_precheck(sc, folio, nr_pages,
+								       source))
 						memcompress_ctx =
 							memcompress_reclaim_ctx_get(nr_pages,
 										   source);
@@ -2180,6 +2774,9 @@ backing_ready:
 			 */
 			try_to_unmap_flush_dirty();
 			switch (pageout(folio, mapping, &plug)) {
+			case PAGE_QUEUED:
+				stat->nr_pageout += nr_pages;
+				goto keep;
 			case PAGE_KEEP:
 				goto keep_locked;
 			case PAGE_ACTIVATE:
@@ -5630,6 +6227,9 @@ static bool should_abort_scan(struct lruvec *lruvec, struct scan_control *sc)
 	enum zone_watermarks mark;
 	bool bypass = false;
 
+	if (sc->memcompress_direct_anon_stalled)
+		return true;
+
 #ifdef CONFIG_ANDROID_VENDOR_OEM_DATA
 	trace_android_vh_mglru_should_abort_scan(&sc->android_vendor_data1, &bypass);
 #endif
@@ -6832,6 +7432,10 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 				   sc->nr_scanned - scanned,
 				   sc->nr_reclaimed - reclaimed);
 
+		if (sc->memcompress_direct_anon_stalled) {
+			mem_cgroup_iter_break(target_memcg, memcg);
+			break;
+		}
 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, NULL)));
 }
 
@@ -6841,11 +7445,16 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 	struct lruvec *target_lruvec;
 	bool reclaimable = false;
 
+	sc->memcompress_direct_reject_pages = 0;
+	sc->memcompress_direct_reject_run = 0;
+	sc->memcompress_direct_anon_stalled = false;
+	sc->memcompress_direct_nid = pgdat->node_id;
+
 	trace_android_vh_shrink_node(pgdat, sc->target_mem_cgroup);
 	if (lru_gen_enabled() && root_reclaim(sc)) {
 		memset(&sc->nr, 0, sizeof(sc->nr));
 		lru_gen_shrink_node(pgdat, sc);
-		return;
+		goto done;
 	}
 
 	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
@@ -6946,6 +7555,8 @@ again:
 	 */
 	if (reclaimable)
 		pgdat->kswapd_failures = 0;
+done:
+	memcompress_direct_feedback(sc);
 }
 
 /*
@@ -7182,6 +7793,9 @@ retry:
 		sc->nr_scanned = 0;
 		shrink_zones(zonelist, sc);
 
+		if (sc->memcompress_direct_feedback_progress)
+			break;
+
 		if (sc->nr_reclaimed >= sc->nr_to_reclaim)
 			break;
 
@@ -7218,6 +7832,10 @@ retry:
 
 	if (sc->nr_reclaimed)
 		return sc->nr_reclaimed;
+
+	/* Successful work elsewhere is an allocator retry hint, not our page. */
+	if (sc->memcompress_direct_feedback_progress)
+		return 1;
 
 	/* Aborted reclaim to try compaction? don't OOM, then */
 	if (sc->compaction_ready)
@@ -7402,6 +8020,8 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 	};
 	bool skip_swap = false;
 	int prio = 0;
+
+	sc.memcompress_direct_feedback_enabled = IS_ENABLED(CONFIG_MEMCOMPRESS);
 
 	/*
 	 * scan_control uses s8 fields for order, priority, and reclaim_idx.
@@ -7774,12 +8394,14 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 	unsigned long zone_boosts[MAX_NR_ZONES] = { 0, };
 	bool boosted;
 	struct zone *zone;
+	struct kreclaimd_feedback feedback = {};
 	struct scan_control sc = {
 		.gfp_mask = GFP_KERNEL,
 		.order = order,
 		.may_unmap = 1,
 	};
 
+	kreclaimd_feedback_init(pgdat, &feedback);
 	set_task_reclaim_state(current, &sc.reclaim_state);
 	psi_memstall_enter(&pflags);
 	__fs_reclaim_acquire(_THIS_IP_);
@@ -7811,6 +8433,7 @@ restart:
 		bool balanced;
 		bool ret;
 
+		kreclaimd_collect(&feedback, &sc);
 		sc.reclaim_idx = highest_zoneidx;
 
 		/*
@@ -7896,6 +8519,12 @@ restart:
 		 */
 		if (kswapd_shrink_node(pgdat, &sc))
 			raise_priority = false;
+		kreclaimd_feedback_wait(&feedback, &sc, nr_reclaimed);
+		/* Apply the scan policy to synchronous and worker success alike. */
+		if (max(sc.nr_scanned, sc.nr_reclaimed - nr_reclaimed) >= sc.nr_to_reclaim)
+			raise_priority = false;
+		if (sc.order && sc.nr_reclaimed >= compact_gap(sc.order))
+			sc.order = 0;
 
 		/*
 		 * If the low watermark is met there is no need for processes
@@ -7932,10 +8561,12 @@ restart:
 			sc.priority--;
 	} while (sc.priority >= 1);
 
+	kreclaimd_collect(&feedback, &sc);
 	if (!sc.nr_reclaimed)
 		pgdat->kswapd_failures++;
 
 out:
+	kreclaimd_collect(&feedback, &sc);
 	clear_reclaim_active(pgdat, highest_zoneidx);
 
 	/* If reclaim was boosted, account for the reclaim done in this pass */
@@ -8283,6 +8914,8 @@ void __meminit kswapd_run(int nid)
 			pgdat->kswapd = NULL;
 		}
 	}
+	if (pgdat->kswapd)
+		kreclaimd_run(pgdat);
 	pgdat_kswapd_unlock(pgdat);
 }
 
@@ -8301,6 +8934,7 @@ void __meminit kswapd_stop(int nid)
 		kthread_stop(kswapd);
 		pgdat->kswapd = NULL;
 	}
+	kreclaimd_stop(pgdat);
 	pgdat_kswapd_unlock(pgdat);
 }
 

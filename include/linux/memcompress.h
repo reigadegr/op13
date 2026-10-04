@@ -15,7 +15,7 @@ struct memcompress_reclaim_ctx;
 enum memcompress_reclaim_source {
 	MEMCOMPRESS_RECLAIM_DIRECT,
 	MEMCOMPRESS_RECLAIM_KSWAPD,
-	/* Admission classes; the current port does not create worker tasks. */
+	/* Asynchronous background reclaim admission classes. */
 	MEMCOMPRESS_RECLAIM_WORKER,
 	MEMCOMPRESS_RECLAIM_BURST,
 	MEMCOMPRESS_RECLAIM_SOURCE_NR,
