@@ -283,3 +283,38 @@ async multi-page folios, failure injection and node removal need other tests.
 QEMU Cortex-A76 has no MTE, so configured HW_TAGS does not establish runtime
 hardware-tag sanitizer coverage. Keep virtual-machine functionality evidence
 separate from phone stability, foreground latency and energy measurements.
+
+Packed payload writeback
+========================
+
+Stored payloads now have a reclaim LRU. Four append-only batches pack payloads
+at 16-byte boundaries into ordinary swap pages through native swapcache I/O.
+Batch references keep the original payload alive for concurrent faults and
+unmaps. Only successful completion publishes SWAPPED storage and releases the
+zpool handle and charge. Native swap write errors redirty the I/O folio; those
+batches retain their original payloads. Each packed page owns one ordinary
+swap reference shared by its members. Token PTEs and architecture metadata
+remain keyed by the original memcompress token.
+
+A node-zero kswapd scope supplies the audited pool/stored feedback budget to a
+shrinker, with at most 512 entries per scan. Actual zsmalloc physical-page
+release supplies reclaim-state accounting. Direct-reclaim admission is unchanged.
+Delayed drain, low-watermark feedback and sparse-page defragmentation are
+separate follow-up work.
+
+The native-only ``writeback`` sysfs control accepts an entry budget of 1..512;
+``writeback_stat`` reports live swap pages, swapped payload bytes, cumulative
+written pages, batch errors and LRU entries. The existing payload counter now
+excludes disk-only payloads. Same-filled entries remain in RAM without payload
+allocation. The controls are not claims of vendor sysfs ABI parity.
+
+After disabling allocation from a swap device, swapoff joins packed batches
+and restores their payloads to charged zpool storage before native PTE unuse.
+An allocation, charge or read failure returns an error without discarding the
+remaining disk references. Native swapoff then re-enables the device.
+
+The companion QEMU runner's ``--mode packed`` checks disk fault-in, COW,
+concurrent fault/unmap, swapoff and no-swap fallback. ``--packed-fail-io`` injects
+one virtual-disk write failure. ``--packed-pressure`` requires real automatic
+packed writes under background pressure. These tests use private guest swap
+files, not phone storage; they do not establish hardware MTE or phone latency.

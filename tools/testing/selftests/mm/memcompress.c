@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/swap.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -799,6 +800,152 @@ static void test_thp_alloc_failure(void)
 	ksft_test_result(valid, "THP allocation failure falls back to base pages\n");
 }
 
+#define WRITEBACK_PATH "/sys/kernel/mm/memcompress/writeback"
+#define WRITEBACK_STAT "/sys/kernel/mm/memcompress/writeback_stat"
+
+static long packed_stat(const char *name)
+{
+	char key[64];
+	long value, result = -1;
+	FILE *file = fopen(WRITEBACK_STAT, "r");
+
+	if (!file)
+		return -1;
+	while (fscanf(file, "%63s %ld", key, &value) == 2)
+		if (!strcmp(key, name)) {
+			result = value;
+			break;
+		}
+	fclose(file);
+	return result;
+}
+
+static int packed_writeback(unsigned int count)
+{
+	char value[32];
+	int fd = open(WRITEBACK_PATH, O_WRONLY), len, ret;
+
+	if (fd < 0)
+		return -errno;
+	len = snprintf(value, sizeof(value), "%u\n", count);
+	ret = write(fd, value, len);
+	ret = ret == len ? 0 : -errno;
+	close(fd);
+	return ret;
+}
+
+static bool packed_fixture(void)
+{
+	cpu_set_t pinned, saved;
+	int cpu = sched_getcpu();
+	bool valid;
+
+	CPU_ZERO(&pinned);
+	if (cpu < 0 || sched_getaffinity(0, sizeof(saved), &saved))
+		return false;
+	CPU_SET(cpu, &pinned);
+	if (sched_setaffinity(0, sizeof(pinned), &pinned))
+		return false;
+	valid = !madvise(data, data_size, MADV_DONTNEED);
+	visit_data(COMPRESSIBLE, 0, true);
+	valid &= thp_pageout();
+	return !sched_setaffinity(0, sizeof(saved), &saved) && valid;
+}
+
+static void *packed_writer(void *arg)
+{
+	int *ret = arg;
+
+	*ret = packed_writeback(512);
+	return NULL;
+}
+
+static void test_packed_swap(const char *device, bool fail_io)
+{
+	size_t swapped = 0, resident = 0;
+	bool valid;
+	long pages, bytes, errors;
+	pthread_t thread;
+	int ret, status;
+	pid_t pid;
+
+	ksft_set_plan(fail_io ? 7 : 6);
+	if (fail_io) {
+		valid = packed_fixture();
+		errors = packed_stat("writeback_errors");
+		valid &= packed_writeback(16) == -EIO;
+		valid &= packed_stat("writeback_errors") == errors + 1;
+		valid &= packed_stat("swap_pages") == 0;
+		valid &= visit_data(COMPRESSIBLE, 0, false);
+		ksft_test_result(valid, "packed write error retains original payloads\n");
+	}
+
+	valid = packed_fixture() && !packed_writeback(512);
+	pages = packed_stat("swap_pages");
+	bytes = packed_stat("swapped_bytes");
+	valid &= pages > 0 && pages < (long)nr_pages && bytes > 0;
+	valid &= !snapshot(after, &swapped, &resident) && swapped == nr_pages;
+	ksft_print_msg("packed pages=%ld payload_bytes=%ld token_pages=%zu\n",
+		       pages, bytes, swapped);
+	valid &= visit_data(COMPRESSIBLE, 0, false);
+	valid &= packed_stat("swap_pages") == 0 && packed_stat("swapped_bytes") == 0;
+	ksft_test_result(valid, "packed disk fault restores every word and releases swap slots\n");
+
+	valid = packed_fixture() && !packed_writeback(512);
+	pid = fork();
+	if (!pid) {
+		bool child = visit_data(COMPRESSIBLE, 0, false);
+
+		visit_data(COMPRESSIBLE, 1, true);
+		_exit(child && visit_data(COMPRESSIBLE, 1, false) ? 0 : 1);
+	}
+	valid &= pid > 0;
+	if (pid > 0)
+		valid &= waitpid(pid, &status, 0) == pid &&
+			 WIFEXITED(status) && !WEXITSTATUS(status);
+	valid &= visit_data(COMPRESSIBLE, 0, false);
+	valid &= packed_stat("swap_pages") == 0;
+	ksft_test_result(valid, "packed fork preserves COW data and slot lifetime\n");
+
+	valid = packed_fixture();
+	ret = -1;
+	if (pthread_create(&thread, NULL, packed_writer, &ret)) {
+		valid = false;
+	} else {
+		valid &= visit_data(COMPRESSIBLE, 0, false);
+		valid &= !pthread_join(thread, NULL) && !ret;
+	}
+	valid &= packed_stat("swap_pages") == 0;
+	ksft_test_result(valid, "faults racing packed writeback preserve data\n");
+
+	valid = packed_fixture();
+	ret = -1;
+	if (pthread_create(&thread, NULL, packed_writer, &ret)) {
+		valid = false;
+	} else {
+		valid &= !madvise(data, data_size, MADV_DONTNEED);
+		valid &= !pthread_join(thread, NULL) && !ret;
+	}
+	valid &= packed_stat("swap_pages") == 0 && packed_stat("swapped_bytes") == 0;
+	ksft_test_result(valid, "unmap racing packed writeback releases every slot\n");
+
+	valid = packed_fixture() && !packed_writeback(512);
+	valid &= packed_stat("swap_pages") > 0;
+	ret = swapoff(device);
+	ksft_print_msg("packed swapoff ret=%d errno=%d\n", ret, ret ? errno : 0);
+	valid &= !ret && !swap_devices_present();
+	valid &= packed_stat("swap_pages") == 0 && packed_stat("swapped_bytes") == 0;
+	valid &= !snapshot(after, &swapped, &resident) && swapped == nr_pages;
+	valid &= visit_data(COMPRESSIBLE, 0, false);
+	ksft_test_result(valid, "swapoff restores payloads and preserves token PTEs\n");
+
+	valid = packed_fixture();
+	valid &= packed_writeback(512) == -ENOSPC;
+	valid &= visit_data(COMPRESSIBLE, 0, false);
+	valid &= packed_stat("swap_pages") == 0;
+	ksft_test_result(valid, "writeback without swap retains original data\n");
+}
+
 static void usage(const char *program)
 {
 	printf("Usage: %s [--token-type N] [--strict-rollback] [--strict-smaps]\n"
@@ -806,6 +953,8 @@ static void usage(const char *program)
 	       program);
 	printf("  --thp-pages N      Add THP tests; requires matching mTHP sysfs policy.\n");
 	printf("  --thp-fail-alloc   Requires task-filtered order>0 fail_page_alloc setup.\n");
+	printf("  --packed-swap DEV  Test packed I/O; removes the supplied active test swap.\n");
+	printf("  --packed-fail-io   Expect one injected error on the first packed write.\n");
 	printf("Default: check data and COW; report PTE and smaps behavior.\n");
 	printf("  --token-type N     Expected pagemap swap type, 0..31 (default 27).\n");
 	printf("  --strict-rollback  Require rejected pages to remain resident.\n");
@@ -837,9 +986,17 @@ int main(int argc, char **argv)
 	void *mapping;
 	size_t mapping_size;
 	int argument, ret;
+	const char *packed_device = NULL;
+	bool packed_fail_io = false;
 
 	for (argument = 1; argument < argc; argument++) {
-		if (!strcmp(argv[argument], "--strict-rollback"))
+		if (!strcmp(argv[argument], "--packed-swap")) {
+			if (++argument == argc)
+				ksft_exit_fail_msg("--packed-swap requires a test swap device\n");
+			packed_device = argv[argument];
+		} else if (!strcmp(argv[argument], "--packed-fail-io"))
+			packed_fail_io = true;
+		else if (!strcmp(argv[argument], "--strict-rollback"))
 			strict_rollback = true;
 		else if (!strcmp(argv[argument], "--strict-smaps"))
 			strict_smaps = true;
@@ -867,7 +1024,7 @@ int main(int argc, char **argv)
 	ksft_print_header();
 	if (access("/sys/kernel/mm/memcompress/stat", R_OK))
 		ksft_exit_skip("memcompress sysfs is unavailable\n");
-	if (swap_devices_present())
+	if (!packed_device && swap_devices_present())
 		ksft_exit_skip("requires no configured swap devices for PTE attribution\n");
 	ret = admission_status();
 	if (ret == -EOPNOTSUPP || ret == -EACCES || ret == -EPERM)
@@ -901,7 +1058,11 @@ int main(int argc, char **argv)
 		ksft_exit_skip("cannot prepare isolated base-page mapping\n");
 	signal(SIGALRM, timeout_handler);
 	signal(SIGPIPE, SIG_IGN);
-	alarm(thp_pages ? 180 : 45);
+	alarm(thp_pages || packed_device ? 180 : 45);
+	if (packed_device) {
+		test_packed_swap(packed_device, packed_fail_io);
+		goto out;
+	}
 	ksft_set_plan(TEST_COUNT + (thp_pages ? 10 : 0) + thp_fail_alloc);
 	test_roundtrip(SAMEFILL, "same-filled page roundtrip");
 	test_roundtrip(COMPRESSIBLE, "compressible payload roundtrip");
@@ -925,6 +1086,7 @@ int main(int argc, char **argv)
 		if (thp_fail_alloc)
 			test_thp_alloc_failure();
 	}
+out:
 	alarm(0);
 	munmap(mapping, mapping_size);
 	free(before);

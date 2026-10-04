@@ -39,6 +39,9 @@ static inline unsigned long memcompress_folio_token(struct folio *folio)
 }
 
 #ifdef CONFIG_MEMCOMPRESS
+int memcompress_swapoff(unsigned int type);
+void memcompress_reclaim_writeback_begin(int nid);
+void memcompress_reclaim_writeback_end(int nid);
 bool memcompress_available(void);
 bool is_memcompress_shadow(void *shadow);
 unsigned long memcompress_shadow_token(void *shadow);
@@ -101,6 +104,9 @@ bool memcompress_reclaim_inflight(int nid);
 u64 memcompress_reclaim_progress(int nid);
 long memcompress_wait_reclaim_progress(int nid, u64 cursor, long timeout);
 #else
+static inline int memcompress_swapoff(unsigned int type) { return 0; }
+static inline void memcompress_reclaim_writeback_begin(int nid) { }
+static inline void memcompress_reclaim_writeback_end(int nid) { }
 static inline bool memcompress_available(void) { return false; }
 static inline bool is_memcompress_shadow(void *shadow) { return false; }
 static inline unsigned long memcompress_shadow_token(void *shadow) { return 0; }

@@ -53,6 +53,7 @@
 #include <linux/preempt.h>
 #include <linux/spinlock.h>
 #include <linux/shrinker.h>
+#include <linux/swap.h>
 #include <linux/types.h>
 #include <linux/debugfs.h>
 #include <linux/zsmalloc.h>
@@ -869,6 +870,7 @@ static void __free_zspage(struct zs_pool *pool, struct size_class *class,
 		page = next;
 	} while (page != NULL);
 
+	mm_account_reclaimed_pages(class->pages_per_zspage);
 	cache_free_zspage(pool, zspage);
 
 	class_stat_dec(class, ZS_OBJS_ALLOCATED, class->objs_per_zspage);

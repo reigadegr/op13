@@ -15,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/kernel_stat.h>
 #include <linux/swap.h>
+#include <linux/memcompress.h>
 #include <linux/vmalloc.h>
 #include <linux/pagemap.h>
 #include <linux/namei.h>
@@ -2847,7 +2848,9 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 	disable_swap_slots_cache_lock();
 
 	set_current_oom_origin();
-	err = try_to_unuse(p->type);
+	err = memcompress_swapoff(p->type);
+	if (!err)
+		err = try_to_unuse(p->type);
 	clear_current_oom_origin();
 
 	if (err) {
