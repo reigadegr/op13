@@ -805,11 +805,11 @@ static void test_thp_alloc_failure(void)
 #define WRITEBACK_PATH "/sys/kernel/mm/memcompress/writeback"
 #define WRITEBACK_STAT "/sys/kernel/mm/memcompress/writeback_stat"
 
-static long packed_stat(const char *name)
+static long named_stat(const char *path, const char *name)
 {
 	char key[64];
 	long value, result = -1;
-	FILE *file = fopen(WRITEBACK_STAT, "r");
+	FILE *file = fopen(path, "r");
 
 	if (!file)
 		return -1;
@@ -822,10 +822,18 @@ static long packed_stat(const char *name)
 	return result;
 }
 
-static int packed_writeback(unsigned int count)
+static long packed_stat(const char *name)
 {
-	char value[32];
-	int fd = open(WRITEBACK_PATH, O_WRONLY), len, ret;
+	return named_stat(WRITEBACK_STAT, name);
+}
+
+static int packed_control(const char *name, unsigned int count)
+{
+	char value[32], path[128];
+	int fd, len, ret;
+
+	snprintf(path, sizeof(path), "/sys/kernel/mm/memcompress/%s", name);
+	fd = open(path, O_WRONLY);
 
 	if (fd < 0)
 		return -errno;
@@ -835,6 +843,13 @@ static int packed_writeback(unsigned int count)
 	close(fd);
 	return ret;
 }
+
+static int packed_writeback(unsigned int count)
+{
+	return packed_control("writeback", count);
+}
+
+static bool packed_wait_empty(void);
 
 static bool packed_fixture(void)
 {
@@ -877,7 +892,7 @@ static void test_packed_swap(const char *device, bool fail_io)
 		errors = packed_stat("writeback_errors");
 		valid &= packed_writeback(16) == -EIO;
 		valid &= packed_stat("writeback_errors") == errors + 1;
-		valid &= packed_stat("swap_pages") == 0;
+		valid &= packed_wait_empty();
 		valid &= visit_data(COMPRESSIBLE, 0, false);
 		ksft_test_result(valid, "packed write error retains original payloads\n");
 	}
@@ -890,7 +905,7 @@ static void test_packed_swap(const char *device, bool fail_io)
 	ksft_print_msg("packed pages=%ld payload_bytes=%ld token_pages=%zu\n",
 		       pages, bytes, swapped);
 	valid &= visit_data(COMPRESSIBLE, 0, false);
-	valid &= packed_stat("swap_pages") == 0 && packed_stat("swapped_bytes") == 0;
+	valid &= packed_wait_empty() && packed_stat("swapped_bytes") == 0;
 	ksft_test_result(valid, "packed disk fault restores every word and releases swap slots\n");
 
 	valid = packed_fixture() && !packed_writeback(512);
@@ -906,7 +921,7 @@ static void test_packed_swap(const char *device, bool fail_io)
 		valid &= waitpid(pid, &status, 0) == pid &&
 			 WIFEXITED(status) && !WEXITSTATUS(status);
 	valid &= visit_data(COMPRESSIBLE, 0, false);
-	valid &= packed_stat("swap_pages") == 0;
+	valid &= packed_wait_empty();
 	ksft_test_result(valid, "packed fork preserves COW data and slot lifetime\n");
 
 	valid = packed_fixture();
@@ -917,7 +932,7 @@ static void test_packed_swap(const char *device, bool fail_io)
 		valid &= visit_data(COMPRESSIBLE, 0, false);
 		valid &= !pthread_join(thread, NULL) && !ret;
 	}
-	valid &= packed_stat("swap_pages") == 0;
+	valid &= packed_wait_empty();
 	ksft_test_result(valid, "faults racing packed writeback preserve data\n");
 
 	valid = packed_fixture();
@@ -928,7 +943,7 @@ static void test_packed_swap(const char *device, bool fail_io)
 		valid &= !madvise(data, data_size, MADV_DONTNEED);
 		valid &= !pthread_join(thread, NULL) && !ret;
 	}
-	valid &= packed_stat("swap_pages") == 0 && packed_stat("swapped_bytes") == 0;
+	valid &= packed_wait_empty() && packed_stat("swapped_bytes") == 0;
 	ksft_test_result(valid, "unmap racing packed writeback releases every slot\n");
 
 	valid = packed_fixture() && !packed_writeback(512);
@@ -936,7 +951,7 @@ static void test_packed_swap(const char *device, bool fail_io)
 	ret = swapoff(device);
 	ksft_print_msg("packed swapoff ret=%d errno=%d\n", ret, ret ? errno : 0);
 	valid &= !ret && !swap_devices_present();
-	valid &= packed_stat("swap_pages") == 0 && packed_stat("swapped_bytes") == 0;
+	valid &= packed_wait_empty() && packed_stat("swapped_bytes") == 0;
 	valid &= !snapshot(after, &swapped, &resident) && swapped == nr_pages;
 	valid &= visit_data(COMPRESSIBLE, 0, false);
 	ksft_test_result(valid, "swapoff restores payloads and preserves token PTEs\n");
@@ -944,7 +959,7 @@ static void test_packed_swap(const char *device, bool fail_io)
 	valid = packed_fixture();
 	valid &= packed_writeback(512) == -ENOSPC;
 	valid &= visit_data(COMPRESSIBLE, 0, false);
-	valid &= packed_stat("swap_pages") == 0;
+	valid &= packed_wait_empty();
 	ksft_test_result(valid, "writeback without swap retains original data\n");
 }
 
@@ -981,7 +996,7 @@ static void test_packed_swapoff(const char *device, bool fail_read)
 		valid &= ret == -1 && errno == EIO && swap_devices_present();
 		valid &= packed_stat("swap_pages") > 0;
 		valid &= visit_data(COMPRESSIBLE, 0, false);
-		valid &= packed_stat("swap_pages") == 0;
+		valid &= packed_wait_empty();
 		ksft_test_result(valid, "swapoff read error preserves backing and device\n");
 	}
 
@@ -1037,7 +1052,7 @@ static void test_packed_swapoff(const char *device, bool fail_read)
 		valid &= !pthread_join(thread, NULL);
 		valid &= !writer_ret || writer_ret == -ENOSPC;
 	}
-	valid &= inflight && !swap_devices_present() && packed_stat("swap_pages") == 0;
+	valid &= inflight && !swap_devices_present() && packed_wait_empty();
 	valid &= visit_data(COMPRESSIBLE, 0, false);
 	ksft_print_msg("packed swapoff overlap=%d writer_result=%d\n", inflight, writer_ret);
 	ksft_test_result(valid, "swapoff joins in-flight packed batches and releases the device\n");
@@ -1059,10 +1074,159 @@ static void test_packed_swapoff(const char *device, bool fail_read)
 	valid &= packed_stat("swap_pages") > 0;
 	valid &= self_setting(path, "max");
 	valid &= !swapoff(device);
-	valid &= packed_stat("swap_pages") == 0 && visit_data(COMPRESSIBLE, 0, false);
+	valid &= packed_wait_empty() && visit_data(COMPRESSIBLE, 0, false);
 	valid &= !madvise(data, data_size, MADV_DONTNEED);
 	valid &= !rmdir(cg);
 	ksft_test_result(valid, "swapoff charge failure preserves tokens for a successful retry\n");
+}
+
+static bool packed_wait_empty(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < 5000; i++) {
+		if (!packed_stat("swap_pages"))
+			return true;
+		usleep(1000);
+	}
+	return false;
+}
+
+static bool packed_wait_drain(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < 5000; i++) {
+		if (!packed_stat("drain_pending") &&
+		    (!packed_stat("lru_entries") || packed_stat("drain_error")))
+			return true;
+		usleep(1000);
+	}
+	return false;
+}
+
+static void *packed_defrag_thread(void *arg)
+{
+	int *result = arg;
+	unsigned int i;
+
+	for (i = 0; i < 4 && !*result; i++)
+		*result = packed_control("defrag", 1);
+	return NULL;
+}
+
+static void test_packed_maintenance(const char *device, bool fail_io)
+{
+	bool valid;
+	long before_pages, after_pages, before_runs, before_bytes;
+	pthread_t thread;
+	int ret;
+	size_t i;
+
+	ksft_set_plan(fail_io ? 10 : 8);
+	if (fail_io) {
+		valid = packed_fixture() && !packed_control("drain", 16);
+		valid &= packed_wait_drain() && packed_stat("drain_error") == -EIO;
+		valid &= visit_data(COMPRESSIBLE, 0, false) && packed_wait_empty();
+		ksft_test_result(valid, "delayed drain write error retains every payload\n");
+	}
+
+	valid = packed_fixture();
+	for (i = 1; i < nr_pages; i += 2)
+		valid &= __atomic_load_n(data + i * page_size / sizeof(*data), __ATOMIC_RELAXED) ==
+			 (UINT64_C(0x6d656d636f6d7000) ^ i);
+	before_pages = named_stat("/sys/kernel/mm/memcompress/debug_stat", "pool_bytes");
+	valid &= !packed_control("defrag", 1);
+	after_pages = named_stat("/sys/kernel/mm/memcompress/debug_stat", "pool_bytes");
+	ksft_print_msg("RAM compaction pool_bytes=%ld -> %ld\n", before_pages, after_pages);
+	valid &= before_pages > after_pages && after_pages > 0;
+	valid &= visit_data(COMPRESSIBLE, 0, false);
+	ksft_test_result(valid, "RAM compaction releases allocator pages and preserves data\n");
+
+	valid = packed_fixture() && !packed_writeback(512);
+	valid &= self_setting("/sys/kernel/mm/memcompress/enabled", "0");
+	for (i = 1; i < nr_pages; i += 2)
+		valid &= __atomic_load_n(data + i * page_size / sizeof(*data), __ATOMIC_RELAXED) ==
+			 (UINT64_C(0x6d656d636f6d7000) ^ i);
+	before_pages = packed_stat("swap_pages");
+	before_bytes = packed_stat("swapped_bytes");
+	before_runs = packed_stat("defrag_relocated");
+	if (fail_io) {
+		long errors = packed_stat("writeback_errors");
+
+		valid &= packed_control("defrag", 1) == -EIO;
+		valid &= packed_stat("writeback_errors") == errors + 1;
+		valid &= before_bytes == packed_stat("swapped_bytes");
+		ksft_test_result(valid, "defrag target write failure preserves source slots\n");
+	}
+	for (i = 0; i < 4; i++)
+		valid &= !packed_control("defrag", 1);
+	after_pages = packed_stat("swap_pages");
+	ksft_print_msg("packed defrag pages=%ld -> %ld bytes=%ld -> %ld\n",
+		       before_pages, after_pages, before_bytes, packed_stat("swapped_bytes"));
+	valid &= before_pages > after_pages && after_pages > 0;
+	valid &= before_bytes == packed_stat("swapped_bytes");
+	valid &= packed_stat("defrag_relocated") > before_runs;
+	valid &= visit_data(COMPRESSIBLE, 0, false) && packed_wait_empty();
+	valid &= self_setting("/sys/kernel/mm/memcompress/enabled", "1");
+	ksft_test_result(valid, "sparse packed pages consolidate without changing payloads\n");
+
+	valid = packed_fixture() && !packed_writeback(512);
+	before_pages = packed_stat("swap_pages");
+	before_runs = packed_stat("defrag_relocated");
+	for (i = 1; i < nr_pages; i += 2)
+		valid &= __atomic_load_n(data + i * page_size / sizeof(*data), __ATOMIC_RELAXED) ==
+			 (UINT64_C(0x6d656d636f6d7000) ^ i);
+	for (i = 0; i < 5000 && packed_stat("defrag_relocated") == before_runs; i++)
+		usleep(1000);
+	valid &= packed_stat("defrag_relocated") > before_runs;
+	valid &= packed_stat("swap_pages") < before_pages;
+	valid &= visit_data(COMPRESSIBLE, 0, false) && packed_wait_empty();
+	ksft_test_result(valid, "sparse-page release triggers background defragmentation\n");
+
+	for (unsigned int unmap = 0; unmap < 2; unmap++) {
+		valid = packed_fixture() && !packed_writeback(512);
+		valid &= self_setting("/sys/kernel/mm/memcompress/enabled", "0");
+		for (i = 1; i < nr_pages; i += 2)
+			valid &= __atomic_load_n(data + i * page_size / sizeof(*data),
+						__ATOMIC_RELAXED) ==
+				 (UINT64_C(0x6d656d636f6d7000) ^ i);
+		ret = 0;
+		if (pthread_create(&thread, NULL, packed_defrag_thread, &ret)) {
+			valid = false;
+		} else {
+			if (unmap)
+				valid &= !madvise(data, data_size, MADV_DONTNEED);
+			else
+				valid &= visit_data(COMPRESSIBLE, 0, false);
+			valid &= !pthread_join(thread, NULL) && !ret;
+		}
+		valid &= packed_wait_empty() && !packed_stat("swapped_bytes");
+		valid &= self_setting("/sys/kernel/mm/memcompress/enabled", "1");
+		ksft_test_result(valid, "%s racing defrag releases all source and target slots\n",
+				 unmap ? "unmap" : "fault");
+	}
+
+	valid = packed_fixture();
+	before_runs = packed_stat("drain_runs");
+	valid &= !packed_control("drain", 512) && packed_wait_drain();
+	valid &= packed_stat("drain_runs") > before_runs;
+	valid &= packed_stat("swapped_bytes") > 0 && !packed_stat("drain_error");
+	valid &= visit_data(COMPRESSIBLE, 0, false) && packed_wait_empty();
+	ksft_test_result(valid, "delayed drain exhausts its bounded entry budget\n");
+
+	valid = packed_fixture() && !packed_control("drain", 512);
+	valid &= self_setting("/sys/kernel/mm/memcompress/enabled", "0");
+	valid &= packed_stat("drain_pending") == 0;
+	valid &= visit_data(COMPRESSIBLE, 0, false) && packed_wait_empty();
+	valid &= self_setting("/sys/kernel/mm/memcompress/enabled", "1");
+	ksft_test_result(valid, "disable joins maintenance workers and preserves data\n");
+
+	valid = packed_fixture() && !swapoff(device);
+	valid &= packed_control("drain", 512) == -ENOSPC;
+	valid &= !packed_control("defrag", 1);
+	valid &= visit_data(COMPRESSIBLE, 0, false) && packed_wait_empty();
+	ksft_test_result(valid, "maintenance without swap retains compressed data\n");
 }
 
 static void usage(const char *program)
@@ -1073,6 +1237,7 @@ static void usage(const char *program)
 	printf("  --thp-pages N      Add THP tests; requires matching mTHP sysfs policy.\n");
 	printf("  --thp-fail-alloc   Requires task-filtered order>0 fail_page_alloc setup.\n");
 	printf("  --packed-swap DEV  Test packed I/O; removes the supplied active test swap.\n");
+	printf("  --packed-maintenance Test compaction, defrag and delayed drain.\n");
 	printf("  --packed-swapoff  Test in-flight swapoff and charge failure; needs cgroup v2.\n");
 	printf("  --packed-fail-read Expect one disk read error in swapoff tests.\n");
 	printf("  --packed-fail-io   Expect one injected error on the first packed write.\n");
@@ -1109,13 +1274,16 @@ int main(int argc, char **argv)
 	int argument, ret;
 	const char *packed_device = NULL;
 	bool packed_fail_io = false, packed_swapoff = false, packed_fail_read = false;
+	bool packed_maintenance = false;
 
 	for (argument = 1; argument < argc; argument++) {
 		if (!strcmp(argv[argument], "--packed-swap")) {
 			if (++argument == argc)
 				ksft_exit_fail_msg("--packed-swap requires a test swap device\n");
 			packed_device = argv[argument];
-		} else if (!strcmp(argv[argument], "--packed-swapoff"))
+		} else if (!strcmp(argv[argument], "--packed-maintenance"))
+			packed_maintenance = true;
+		else if (!strcmp(argv[argument], "--packed-swapoff"))
 			packed_swapoff = true;
 		else if (!strcmp(argv[argument], "--packed-fail-read"))
 			packed_fail_read = true;
@@ -1185,7 +1353,9 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 	alarm(thp_pages || packed_device ? 180 : 45);
 	if (packed_device) {
-		if (packed_swapoff)
+		if (packed_maintenance)
+			test_packed_maintenance(packed_device, packed_fail_io);
+		else if (packed_swapoff)
 			test_packed_swapoff(packed_device, packed_fail_read);
 		else
 			test_packed_swap(packed_device, packed_fail_io);

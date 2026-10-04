@@ -334,6 +334,17 @@ u64 zpool_get_total_size(struct zpool *zpool)
 }
 
 /**
+ * zpool_compact() - Compact live objects and release empty allocator pages
+ * @zpool: The pool to compact
+ *
+ * Return: Number of reclaimed pages, or zero if compaction is unsupported.
+ */
+unsigned long zpool_compact(struct zpool *zpool)
+{
+	return zpool->driver->compact ? zpool->driver->compact(zpool->pool) : 0;
+}
+
+/**
  * zpool_can_sleep_mapped - Test if zpool can sleep when do mapped.
  * @zpool:	The zpool to test
  *

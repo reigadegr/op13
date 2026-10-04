@@ -4,8 +4,8 @@
  *
  * The token, same-fill, classifier and payload paths follow the recovered
  * implementation. Native MM helpers replace vendor layout offsets. Storage
- * rejected here remains eligible for the kernel's ordinary swap path; packed
- * swap writeback and its workers are deliberately not implemented here.
+ * rejected here remains eligible for the kernel's ordinary swap path. Packed
+ * payloads use native swap I/O and retain their tokens across writeback.
  */
 #define pr_fmt(fmt) "memcompress: " fmt
 
@@ -56,6 +56,10 @@ enum memcompress_state {
 struct memcompress_swap_page {
 	struct kref refcount;
 	swp_entry_t swap;
+	struct list_head lru;
+	unsigned int live_bytes;
+	unsigned int nr_tokens;
+	u32 tokens[];
 };
 
 struct memcompress_entry {
@@ -121,6 +125,19 @@ static DEFINE_MUTEX(memcompress_writeback_lock);
 static struct memcompress_swap_batch memcompress_batches[MC_SWAP_BATCHES];
 static atomic_long_t memcompress_lru_count;
 static atomic_long_t memcompress_swap_pages;
+static LIST_HEAD(memcompress_swap_lru);
+static DEFINE_SPINLOCK(memcompress_swap_lock);
+static atomic_long_t memcompress_sparse_pages;
+static atomic_long_t memcompress_drain_pending;
+static atomic_long_t memcompress_drain_error;
+static atomic64_t memcompress_drain_runs;
+static atomic64_t memcompress_defrag_runs;
+static atomic64_t memcompress_defrag_relocated;
+static int memcompress_writeback_reclaim_idx;
+static void memcompress_defrag_worker(struct work_struct *work);
+static void memcompress_drain_worker(struct work_struct *work);
+static DECLARE_DELAYED_WORK(memcompress_defrag_work, memcompress_defrag_worker);
+static DECLARE_DELAYED_WORK(memcompress_drain_work, memcompress_drain_worker);
 static atomic_long_t memcompress_swapped_bytes;
 static atomic64_t memcompress_writeback_pages;
 static atomic64_t memcompress_writeback_errors;
@@ -353,6 +370,9 @@ static void memcompress_swap_page_release(struct kref *ref)
 	struct memcompress_swap_page *spage;
 
 	spage = container_of(ref, struct memcompress_swap_page, refcount);
+	spin_lock(&memcompress_swap_lock);
+	list_del(&spage->lru);
+	spin_unlock(&memcompress_swap_lock);
 	swap_free(spage->swap);
 	atomic_long_dec(&memcompress_swap_pages);
 	kfree(spage);
@@ -361,6 +381,43 @@ static void memcompress_swap_page_release(struct kref *ref)
 static void memcompress_swap_page_put(struct memcompress_swap_page *spage)
 {
 	kref_put(&spage->refcount, memcompress_swap_page_release);
+}
+
+static bool memcompress_defrag_needed(unsigned int threshold)
+{
+	unsigned long sparse = atomic_long_read(&memcompress_sparse_pages);
+	unsigned long packed = atomic_long_read(&memcompress_swap_pages);
+
+	return memcompress_available() && sparse >= 2 &&
+		(get_nr_swap_pages() < 9 || sparse * 1000 >= packed * threshold);
+}
+
+/* Serialize enqueue with disabling admission before cancel_delayed_work_sync(). */
+static void memcompress_schedule_defrag(unsigned int threshold)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&memcompress_context_lock, flags);
+	if (memcompress_defrag_needed(threshold))
+		schedule_delayed_work(&memcompress_defrag_work, msecs_to_jiffies(100));
+	spin_unlock_irqrestore(&memcompress_context_lock, flags);
+}
+
+static void memcompress_swap_slot_put(struct memcompress_swap_page *spage,
+				     unsigned int length)
+{
+	unsigned int old;
+
+	spin_lock(&memcompress_swap_lock);
+	old = spage->live_bytes;
+	spage->live_bytes -= ALIGN(length, MC_SWAP_ALIGN);
+	if (old > PAGE_SIZE / 2 && spage->live_bytes <= PAGE_SIZE / 2)
+		atomic_long_inc(&memcompress_sparse_pages);
+	if (!spage->live_bytes)
+		atomic_long_dec(&memcompress_sparse_pages);
+	spin_unlock(&memcompress_swap_lock);
+	memcompress_swap_page_put(spage);
+	memcompress_schedule_defrag(32);
 }
 
 /* PTE invalidation calls this with a page-table spinlock held. */
@@ -373,7 +430,7 @@ static void memcompress_entry_release(struct kref *ref)
 	memcompress_lru_del(entry);
 	if (entry->state == MC_SWAPPED) {
 		atomic_long_sub(entry->length, &memcompress_swapped_bytes);
-		memcompress_swap_page_put(entry->spage);
+		memcompress_swap_slot_put(entry->spage, entry->length);
 	}
 	if (entry->state == MC_STORED)
 		zpool_free(memcompress_pool, entry->handle);
@@ -1195,8 +1252,8 @@ bool memcompress_pending_folio_valid(struct memcompress_entry *entry,
 	return valid;
 }
 
-/* The entry mutex pins spage and its swap reference across the read. */
-static struct folio *memcompress_swap_read(struct memcompress_entry *entry)
+/* The caller pins spage either directly or through a locked entry. */
+static struct folio *memcompress_swap_read(struct memcompress_swap_page *spage)
 {
 	struct page *page;
 	struct folio *folio;
@@ -1204,7 +1261,7 @@ static struct folio *memcompress_swap_read(struct memcompress_entry *entry)
 
 	/* Reclaim may reserve another token on the entry mutex's same shard. */
 	flags = memalloc_noreclaim_save();
-	page = read_swap_cache_async(entry->spage->swap, GFP_NOIO, NULL, 0, NULL);
+	page = read_swap_cache_async(spage->swap, GFP_NOIO, NULL, 0, NULL);
 	memalloc_noreclaim_restore(flags);
 	if (!page)
 		return ERR_PTR(-ENOMEM);
@@ -1246,7 +1303,7 @@ int memcompress_do_load_entry(struct memcompress_entry *entry, void *dst)
 		goto unlock;
 	}
 	if (entry->state == MC_SWAPPED) {
-		swap_folio = memcompress_swap_read(entry);
+		swap_folio = memcompress_swap_read(entry->spage);
 		if (IS_ERR(swap_folio)) {
 			ret = PTR_ERR(swap_folio);
 			goto unlock;
@@ -1503,7 +1560,7 @@ static int memcompress_swap_batch_flush(struct memcompress_swap_batch *batch,
 		return 0;
 	swap = folio->swap;
 	if (batch->count) {
-		spage = kmalloc(sizeof(*spage), GFP_NOIO);
+		spage = kmalloc(struct_size(spage, tokens, batch->count), GFP_NOIO);
 		if (!spage) {
 			ret = -ENOMEM;
 		} else {
@@ -1524,7 +1581,18 @@ static int memcompress_swap_batch_flush(struct memcompress_swap_batch *batch,
 		spage = NULL;
 	} else {
 		kref_init(&spage->refcount);
+		/* One reference per recorded slot, plus the batch's publication pin. */
+		refcount_add(batch->count, &spage->refcount.refcount);
 		spage->swap = swap;
+		spage->live_bytes = batch->used;
+		spage->nr_tokens = batch->count;
+		for (i = 0; i < batch->count; i++)
+			spage->tokens[i] = batch->entries[i]->token;
+		spin_lock(&memcompress_swap_lock);
+		list_add(&spage->lru, &memcompress_swap_lru);
+		if (spage->live_bytes <= PAGE_SIZE / 2)
+			atomic_long_inc(&memcompress_sparse_pages);
+		spin_unlock(&memcompress_swap_lock);
 		atomic_long_inc(&memcompress_swap_pages);
 		atomic64_inc(&memcompress_writeback_pages);
 	}
@@ -1532,26 +1600,34 @@ static int memcompress_swap_batch_flush(struct memcompress_swap_batch *batch,
 		struct memcompress_entry *entry = batch->entries[i];
 
 		mutex_lock(memcompress_entry_lock(entry));
-		/* The batch pin keeps the immutable STORED payload alive during I/O. */
+		/* The batch pin keeps the source payload alive during I/O. */
 		if (spage && atomic_read(&entry->pte_refs)) {
-			kref_get(&spage->refcount);
+			if (entry->state == MC_STORED) {
+				zpool_free(memcompress_pool, entry->handle);
+				memcompress_entry_uncharge(entry, entry->length);
+				atomic_long_sub(entry->length, &memcompress_compressed_bytes);
+				atomic_long_add(entry->length, &memcompress_swapped_bytes);
+			} else {
+				memcompress_swap_slot_put(entry->spage, entry->length);
+			}
 			entry->spage = spage;
 			entry->swap_offset = offset;
 			entry->state = MC_SWAPPED;
-			zpool_free(memcompress_pool, entry->handle);
-			memcompress_entry_uncharge(entry, entry->length);
-			atomic_long_sub(entry->length, &memcompress_compressed_bytes);
-			atomic_long_add(entry->length, &memcompress_swapped_bytes);
 			(*freed)++;
-		} else if (atomic_read(&entry->pte_refs)) {
-			memcompress_lru_add(entry);
+		} else {
+			if (atomic_read(&entry->pte_refs))
+				memcompress_lru_add(entry);
+			if (spage)
+				memcompress_swap_slot_put(spage, entry->length);
 		}
 		offset += ALIGN(entry->length, MC_SWAP_ALIGN);
 		mutex_unlock(memcompress_entry_lock(entry));
 		memcompress_entry_put(entry);
 	}
-	if (spage)
+	if (spage) {
 		memcompress_swap_page_put(spage);
+		memcompress_schedule_defrag(32);
+	}
 	if (ret)
 		atomic64_inc(&memcompress_writeback_errors);
 	batch->folio = NULL;
@@ -1662,7 +1738,7 @@ static int memcompress_swap_restore(struct memcompress_entry *entry)
 	void *dst;
 	int ret;
 
-	folio = memcompress_swap_read(entry);
+	folio = memcompress_swap_read(entry->spage);
 	if (IS_ERR(folio))
 		return PTR_ERR(folio);
 	ret = memcompress_entry_charge(entry, entry->length);
@@ -1681,7 +1757,7 @@ static int memcompress_swap_restore(struct memcompress_entry *entry)
 	entry->state = MC_STORED;
 	atomic_long_add(entry->length, &memcompress_compressed_bytes);
 	atomic_long_sub(entry->length, &memcompress_swapped_bytes);
-	memcompress_swap_page_put(entry->spage);
+	memcompress_swap_slot_put(entry->spage, entry->length);
 	entry->spage = NULL;
 	memcompress_lru_add(entry);
 put:
@@ -1717,14 +1793,209 @@ int memcompress_swapoff(unsigned int type)
 	return ret;
 }
 
+static void memcompress_swap_batch_discard(struct memcompress_swap_batch *batch)
+{
+	struct folio *folio = batch->folio;
+	unsigned int i;
+	swp_entry_t swap;
+
+	if (!folio)
+		return;
+	swap = folio->swap;
+	delete_from_swap_cache(folio);
+	folio_unlock(folio);
+	folio_put(folio);
+	swap_free(swap);
+	for (i = 0; i < batch->count; i++)
+		memcompress_entry_put(batch->entries[i]);
+	batch->folio = NULL;
+	batch->count = 0;
+	batch->used = 0;
+}
+
+/* At most four half-full source pages become at most two target pages. */
+static int memcompress_defrag(unsigned long *relocated)
+{
+	struct memcompress_swap_page *sources[4], *spage;
+	unsigned int nr = 0, scanned = 0, i, j;
+	unsigned int flags = memalloc_noreclaim_save();
+	int ret = 0;
+
+	spin_lock(&memcompress_swap_lock);
+	list_for_each_entry_reverse(spage, &memcompress_swap_lru, lru) {
+		if (++scanned > 32 || nr == ARRAY_SIZE(sources))
+			break;
+		if (spage->live_bytes && spage->live_bytes <= PAGE_SIZE / 2 &&
+		    kref_get_unless_zero(&spage->refcount))
+			sources[nr++] = spage;
+	}
+	for (i = 0; i < nr; i++)
+		list_move(&sources[i]->lru, &memcompress_swap_lru);
+	spin_unlock(&memcompress_swap_lock);
+	if (nr < 2)
+		goto put;
+	atomic64_inc(&memcompress_defrag_runs);
+	for (i = 0; i < nr; i++) {
+		struct memcompress_swap_batch *batch = &memcompress_batches[i / 2];
+		struct folio *folio = memcompress_swap_read(sources[i]);
+
+		if (IS_ERR(folio)) {
+			ret = PTR_ERR(folio);
+			goto discard;
+		}
+		for (j = 0; j < sources[i]->nr_tokens; j++) {
+			struct memcompress_entry *entry;
+
+			entry = memcompress_get_entry(sources[i]->tokens[j]);
+			if (!entry)
+				continue;
+			mutex_lock(memcompress_entry_lock(entry));
+			if (entry->state != MC_SWAPPED || entry->spage != sources[i]) {
+				mutex_unlock(memcompress_entry_lock(entry));
+				memcompress_entry_put(entry);
+				continue;
+			}
+			if (!batch->folio)
+				ret = memcompress_swap_batch_alloc(batch);
+			if (!ret) {
+				memcpy(folio_address(batch->folio) + batch->used,
+				       folio_address(folio) + entry->swap_offset, entry->length);
+				batch->used += ALIGN(entry->length, MC_SWAP_ALIGN);
+				batch->entries[batch->count++] = entry;
+			}
+			mutex_unlock(memcompress_entry_lock(entry));
+			if (ret) {
+				memcompress_entry_put(entry);
+				break;
+			}
+		}
+		folio_put(folio);
+		if (ret)
+			goto discard;
+	}
+	for (i = 0; i < DIV_ROUND_UP(nr, 2); i++) {
+		int error = memcompress_swap_batch_flush(&memcompress_batches[i], relocated);
+
+		if (!ret)
+			ret = error;
+	}
+	atomic64_add(*relocated, &memcompress_defrag_relocated);
+	goto put;
+discard:
+	for (i = 0; i < 2; i++)
+		memcompress_swap_batch_discard(&memcompress_batches[i]);
+put:
+	for (i = 0; i < nr; i++)
+		memcompress_swap_page_put(sources[i]);
+	memalloc_noreclaim_restore(flags);
+	return ret;
+}
+
+static void memcompress_defrag_worker(struct work_struct *work)
+{
+	unsigned long relocated = 0;
+	int ret = 0;
+
+	mutex_lock(&memcompress_writeback_lock);
+	if (memcompress_defrag_needed(16))
+		ret = memcompress_defrag(&relocated);
+	mutex_unlock(&memcompress_writeback_lock);
+	if (!ret && relocated)
+		memcompress_schedule_defrag(16);
+}
+
+static void memcompress_drain_carry(unsigned long budget)
+{
+	long old = atomic_long_read(&memcompress_drain_pending);
+
+	while (budget > old &&
+	       !atomic_long_try_cmpxchg(&memcompress_drain_pending, &old, budget))
+		;
+}
+
+static void memcompress_schedule_drain(unsigned long budget, unsigned long delay)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&memcompress_context_lock, flags);
+	if (memcompress_available()) {
+		memcompress_drain_carry(budget);
+		if (atomic_long_read(&memcompress_drain_pending))
+			schedule_delayed_work(&memcompress_drain_work, delay);
+	}
+	spin_unlock_irqrestore(&memcompress_context_lock, flags);
+}
+
+static void memcompress_drain_worker(struct work_struct *work)
+{
+	unsigned long budget, limit, freed = 0, scanned = 0;
+	int ret = 0;
+
+	mutex_lock(&memcompress_writeback_lock);
+	budget = atomic_long_xchg(&memcompress_drain_pending, 0);
+	if (!memcompress_available() || !budget)
+		goto unlock;
+	if (READ_ONCE(memcompress_writeback_active)) {
+		memcompress_drain_carry(budget);
+		goto unlock;
+	}
+	limit = min3(max(budget / 16, 32UL), budget, 512UL);
+	atomic64_inc(&memcompress_drain_runs);
+	ret = memcompress_writeback(limit, &freed, &scanned);
+	if (freed)
+		zpool_compact(memcompress_pool);
+	atomic_long_set(&memcompress_drain_error, ret);
+	if (!ret && scanned && scanned < budget && atomic_long_read(&memcompress_lru_count))
+		memcompress_drain_carry(budget - scanned);
+unlock:
+	mutex_unlock(&memcompress_writeback_lock);
+	memcompress_schedule_drain(0, msecs_to_jiffies(100));
+}
+
+static ssize_t defrag_store(struct kobject *kobj, struct kobj_attribute *attr,
+			    const char *buf, size_t len)
+{
+	unsigned long relocated = 0;
+	bool run;
+	int ret = kstrtobool(buf, &run);
+
+	if (ret || !run)
+		return ret ? ret : -EINVAL;
+	mutex_lock(&memcompress_writeback_lock);
+	zpool_compact(memcompress_pool);
+	ret = memcompress_defrag(&relocated);
+	mutex_unlock(&memcompress_writeback_lock);
+	return ret ? ret : len;
+}
+
+static ssize_t drain_store(struct kobject *kobj, struct kobj_attribute *attr,
+			   const char *buf, size_t len)
+{
+	unsigned long budget;
+	int ret = kstrtoul(buf, 0, &budget);
+
+	if (ret)
+		return ret;
+	if (!budget || budget > LONG_MAX)
+		return -EINVAL;
+	if (!memcompress_available())
+		return -EOPNOTSUPP;
+	if (!get_nr_swap_pages())
+		return -ENOSPC;
+	atomic_long_set(&memcompress_drain_error, 0);
+	memcompress_schedule_drain(budget, 0);
+	return len;
+}
+
 /* One global pool; only node zero's kswapd supplies this feedback scope. */
-void memcompress_reclaim_writeback_begin(int nid)
+void memcompress_reclaim_writeback_begin(int nid, int reclaim_idx)
 {
 	unsigned long stored, delta, step = 16, count, target = 0;
 	u64 pool, allowance;
 
 	if (nid || !current_is_kswapd() || !memcompress_available() || !total_swap_pages)
 		return;
+	memcompress_writeback_reclaim_idx = reclaim_idx;
 	stored = atomic_long_read(&memcompress_stored_bytes);
 	pool = zpool_get_total_size(memcompress_pool);
 	delta = stored > memcompress_writeback_stored ? stored - memcompress_writeback_stored : 0;
@@ -1749,8 +2020,28 @@ void memcompress_reclaim_writeback_begin(int nid)
 
 void memcompress_reclaim_writeback_end(int nid)
 {
-	if (!nid && current_is_kswapd())
-		WRITE_ONCE(memcompress_writeback_active, false);
+	pg_data_t *pgdat;
+	unsigned long budget;
+	int i;
+
+	if (nid || !current_is_kswapd())
+		return;
+	WRITE_ONCE(memcompress_writeback_active, false);
+	if (!memcompress_available() || !total_swap_pages)
+		return;
+	pgdat = NODE_DATA(nid);
+	for (i = 0; i <= memcompress_writeback_reclaim_idx; i++) {
+		struct zone *zone = &pgdat->node_zones[i];
+
+		if (managed_zone(zone) && zone_watermark_ok_safe(zone, 0,
+				high_wmark_pages(zone), memcompress_writeback_reclaim_idx)) {
+			memcompress_writeback_drain /= 2;
+			break;
+		}
+	}
+	budget = atomic_long_read(&memcompress_lru_count) *
+		 (memcompress_writeback_drain - min(memcompress_writeback_drain, 16UL)) / 1024;
+	memcompress_schedule_drain(budget, msecs_to_jiffies(100));
 }
 
 static unsigned long memcompress_shrinker_count(struct shrinker *shrinker,
@@ -1771,6 +2062,10 @@ static unsigned long memcompress_shrinker_scan(struct shrinker *shrinker,
 	if (!memcompress_shrinker_count(shrinker, sc) ||
 	    !mutex_trylock(&memcompress_writeback_lock))
 		return SHRINK_STOP;
+	if (zpool_compact(memcompress_pool)) {
+		mutex_unlock(&memcompress_writeback_lock);
+		return SHRINK_STOP;
+	}
 	limit = min3(sc->nr_to_scan, memcompress_writeback_budget, 512UL);
 	memcompress_writeback(limit, &freed, &scanned);
 	mutex_unlock(&memcompress_writeback_lock);
@@ -1806,12 +2101,20 @@ static ssize_t writeback_stat_show(struct kobject *kobj, struct kobj_attribute *
 				   char *buf)
 {
 	return sysfs_emit(buf, "swap_pages %ld\nswapped_bytes %ld\n"
-			 "written_pages %lld\nwriteback_errors %lld\nlru_entries %ld\n",
+			 "written_pages %lld\nwriteback_errors %lld\nlru_entries %ld\n"
+			 "sparse_pages %ld\ndefrag_runs %lld\ndefrag_relocated %lld\n"
+			 "drain_runs %lld\ndrain_pending %ld\ndrain_error %ld\n",
 			 atomic_long_read(&memcompress_swap_pages),
 			 atomic_long_read(&memcompress_swapped_bytes),
 			 atomic64_read(&memcompress_writeback_pages),
 			 atomic64_read(&memcompress_writeback_errors),
-			 atomic_long_read(&memcompress_lru_count));
+			 atomic_long_read(&memcompress_lru_count),
+			 atomic_long_read(&memcompress_sparse_pages),
+			 atomic64_read(&memcompress_defrag_runs),
+			 atomic64_read(&memcompress_defrag_relocated),
+			 atomic64_read(&memcompress_drain_runs),
+			 atomic_long_read(&memcompress_drain_pending),
+			 atomic_long_read(&memcompress_drain_error));
 }
 
 static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr,
@@ -1835,6 +2138,11 @@ static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
 	smp_store_release(&memcompress_enabled, enabled);
 	spin_unlock_irqrestore(&memcompress_context_lock, flags);
 	wake_up_all(&memcompress_context_wait);
+	if (!enabled) {
+		cancel_delayed_work_sync(&memcompress_drain_work);
+		cancel_delayed_work_sync(&memcompress_defrag_work);
+		atomic_long_set(&memcompress_drain_pending, 0);
+	}
 	return count;
 }
 
@@ -1874,6 +2182,8 @@ static ssize_t debug_stat_show(struct kobject *kobj, struct kobj_attribute *attr
 		atomic64_read(&memcompress_classifier_bypasses));
 }
 
+static struct kobj_attribute defrag_attr = __ATTR_WO(defrag);
+static struct kobj_attribute drain_attr = __ATTR_WO(drain);
 static struct kobj_attribute writeback_attr = __ATTR_WO(writeback);
 static struct kobj_attribute writeback_stat_attr = __ATTR_RO(writeback_stat);
 static struct kobj_attribute enabled_attr = __ATTR_RW(enabled);
@@ -1883,6 +2193,8 @@ static struct kobj_attribute stat_attr = __ATTR_RO(stat);
 static struct kobj_attribute debug_stat_attr = __ATTR_RO(debug_stat);
 
 static struct attribute *memcompress_attrs[] = {
+	&defrag_attr.attr,
+	&drain_attr.attr,
 	&writeback_attr.attr,
 	&writeback_stat_attr.attr,
 	&enabled_attr.attr,
