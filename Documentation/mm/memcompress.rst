@@ -27,7 +27,9 @@ and contributes no reclaimed pages to the submitting scan. The worker pins
 the anon_vma, reserves tokens, unmaps and flushes deferred TLB invalidations,
 then stores the contents. Failure restores PTEs while the folio lock and
 anon_vma pin are held and puts the folio back on its LRU. Queue rejection
-retains the synchronous path. Direct and targeted reclaim remain synchronous.
+retains the synchronous path. Reclaim performed outside the node's kswapd
+remains synchronous, including caller-driven direct and targeted reclaim.
+Kswapd can also enqueue work while scanning a soft-limit target memcg.
 
 The same FIFO accepts eligible writepage work after pageout has cleared the
 dirty flag and set reclaim. This transfers the lock with an extra folio
