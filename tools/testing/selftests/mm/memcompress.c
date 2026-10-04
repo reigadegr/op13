@@ -26,6 +26,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/swap.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -946,6 +948,123 @@ static void test_packed_swap(const char *device, bool fail_io)
 	ksft_test_result(valid, "writeback without swap retains original data\n");
 }
 
+static bool packed_writer_done;
+
+static void *packed_swapoff_writer(void *arg)
+{
+	packed_writer(arg);
+	__atomic_store_n(&packed_writer_done, true, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+static void packed_interrupt(int sig)
+{
+	(void)sig;
+}
+
+static void test_packed_swapoff(const char *device, bool fail_read)
+{
+	static const char cg[] = "/sys/fs/cgroup/memcompress-swapoff";
+	char path[160];
+	pthread_t thread;
+	long written;
+	bool valid, inflight = false;
+	int ret, writer_ret = 0;
+	unsigned int i;
+
+	ksft_set_plan(fail_read ? 4 : 3);
+	if (fail_read) {
+		valid = packed_fixture() && !packed_writeback(512);
+		errno = 0;
+		ret = swapoff(device);
+		ksft_print_msg("packed read-error swapoff ret=%d errno=%d\n", ret, errno);
+		valid &= ret == -1 && errno == EIO && swap_devices_present();
+		valid &= packed_stat("swap_pages") > 0;
+		valid &= visit_data(COMPRESSIBLE, 0, false);
+		valid &= packed_stat("swap_pages") == 0;
+		ksft_test_result(valid, "swapoff read error preserves backing and device\n");
+	}
+
+	valid = packed_fixture() && !packed_writeback(512);
+	{
+		pid_t pid = fork();
+		int status;
+
+		if (!pid) {
+			struct sigaction action = { .sa_handler = packed_interrupt };
+			struct itimerval timer = {
+				.it_interval = { .tv_usec = 1000 },
+				.it_value = { .tv_usec = 1000 },
+			};
+			bool interrupted;
+
+			sigemptyset(&action.sa_mask);
+			sigaction(SIGALRM, &action, NULL);
+			setitimer(ITIMER_REAL, &timer, NULL);
+			ret = swapoff(device);
+			interrupted = ret == -1 && errno == EINTR;
+			memset(&timer, 0, sizeof(timer));
+			setitimer(ITIMER_REAL, &timer, NULL);
+			_exit(interrupted ? 0 : 1);
+		}
+		valid &= pid > 0;
+		if (pid > 0)
+			valid &= waitpid(pid, &status, 0) == pid &&
+				 WIFEXITED(status) && !WEXITSTATUS(status);
+	}
+	valid &= swap_devices_present() && packed_stat("swap_pages") > 0;
+	valid &= visit_data(COMPRESSIBLE, 0, false);
+	ksft_test_result(valid, "interrupted packed swapoff retains data and remaining slots\n");
+
+	/* The harness throttles writes so a completed batch can precede in-flight I/O. */
+	valid = packed_fixture();
+	written = packed_stat("written_pages");
+	packed_writer_done = false;
+	if (pthread_create(&thread, NULL, packed_swapoff_writer, &writer_ret)) {
+		valid = false;
+	} else {
+		for (i = 0; i < 5000; i++) {
+			if (packed_stat("written_pages") > written &&
+			    !__atomic_load_n(&packed_writer_done, __ATOMIC_ACQUIRE)) {
+				inflight = true;
+				break;
+			}
+			if (__atomic_load_n(&packed_writer_done, __ATOMIC_ACQUIRE))
+				break;
+			usleep(1000);
+		}
+		valid &= !swapoff(device);
+		valid &= !pthread_join(thread, NULL);
+		valid &= !writer_ret || writer_ret == -ENOSPC;
+	}
+	valid &= inflight && !swap_devices_present() && packed_stat("swap_pages") == 0;
+	valid &= visit_data(COMPRESSIBLE, 0, false);
+	ksft_print_msg("packed swapoff overlap=%d writer_result=%d\n", inflight, writer_ret);
+	ksft_test_result(valid, "swapoff joins in-flight packed batches and releases the device\n");
+
+	valid = !swapon(device, 0);
+	valid &= self_setting("/sys/fs/cgroup/cgroup.subtree_control", "+memory");
+	valid &= !mkdir(cg, 0755);
+	snprintf(path, sizeof(path), "%s/cgroup.procs", cg);
+	valid &= self_setting(path, "0");
+	valid &= packed_fixture() && !packed_writeback(512);
+	/* Keep data charged to an empty cgroup; the test itself lives in the root. */
+	valid &= self_setting("/sys/fs/cgroup/cgroup.procs", "0");
+	snprintf(path, sizeof(path), "%s/memory.max", cg);
+	valid &= self_setting(path, "0");
+	errno = 0;
+	ret = swapoff(device);
+	ksft_print_msg("packed charge-error swapoff ret=%d errno=%d\n", ret, errno);
+	valid &= ret == -1 && errno == ENOMEM && swap_devices_present();
+	valid &= packed_stat("swap_pages") > 0;
+	valid &= self_setting(path, "max");
+	valid &= !swapoff(device);
+	valid &= packed_stat("swap_pages") == 0 && visit_data(COMPRESSIBLE, 0, false);
+	valid &= !madvise(data, data_size, MADV_DONTNEED);
+	valid &= !rmdir(cg);
+	ksft_test_result(valid, "swapoff charge failure preserves tokens for a successful retry\n");
+}
+
 static void usage(const char *program)
 {
 	printf("Usage: %s [--token-type N] [--strict-rollback] [--strict-smaps]\n"
@@ -954,6 +1073,8 @@ static void usage(const char *program)
 	printf("  --thp-pages N      Add THP tests; requires matching mTHP sysfs policy.\n");
 	printf("  --thp-fail-alloc   Requires task-filtered order>0 fail_page_alloc setup.\n");
 	printf("  --packed-swap DEV  Test packed I/O; removes the supplied active test swap.\n");
+	printf("  --packed-swapoff  Test in-flight swapoff and charge failure; needs cgroup v2.\n");
+	printf("  --packed-fail-read Expect one disk read error in swapoff tests.\n");
 	printf("  --packed-fail-io   Expect one injected error on the first packed write.\n");
 	printf("Default: check data and COW; report PTE and smaps behavior.\n");
 	printf("  --token-type N     Expected pagemap swap type, 0..31 (default 27).\n");
@@ -987,14 +1108,18 @@ int main(int argc, char **argv)
 	size_t mapping_size;
 	int argument, ret;
 	const char *packed_device = NULL;
-	bool packed_fail_io = false;
+	bool packed_fail_io = false, packed_swapoff = false, packed_fail_read = false;
 
 	for (argument = 1; argument < argc; argument++) {
 		if (!strcmp(argv[argument], "--packed-swap")) {
 			if (++argument == argc)
 				ksft_exit_fail_msg("--packed-swap requires a test swap device\n");
 			packed_device = argv[argument];
-		} else if (!strcmp(argv[argument], "--packed-fail-io"))
+		} else if (!strcmp(argv[argument], "--packed-swapoff"))
+			packed_swapoff = true;
+		else if (!strcmp(argv[argument], "--packed-fail-read"))
+			packed_fail_read = true;
+		else if (!strcmp(argv[argument], "--packed-fail-io"))
 			packed_fail_io = true;
 		else if (!strcmp(argv[argument], "--strict-rollback"))
 			strict_rollback = true;
@@ -1060,7 +1185,10 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 	alarm(thp_pages || packed_device ? 180 : 45);
 	if (packed_device) {
-		test_packed_swap(packed_device, packed_fail_io);
+		if (packed_swapoff)
+			test_packed_swapoff(packed_device, packed_fail_read);
+		else
+			test_packed_swap(packed_device, packed_fail_io);
 		goto out;
 	}
 	ksft_set_plan(TEST_COUNT + (thp_pages ? 10 : 0) + thp_fail_alloc);

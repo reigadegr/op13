@@ -318,3 +318,19 @@ concurrent fault/unmap, swapoff and no-swap fallback. ``--packed-fail-io`` injec
 one virtual-disk write failure. ``--packed-pressure`` requires real automatic
 packed writes under background pressure. These tests use private guest swap
 files, not phone storage; they do not establish hardware MTE or phone latency.
+
+Swapoff cancellation and charging
+--------------------------------
+
+Swapoff checks pending signals between entries and returns EINTR without
+losing remaining backing. Its payload charges must run outside PF_MEMALLOC,
+which otherwise forces memcg charges past the limit. Only disk-read allocation
+uses the no-reclaim scope; restoring a zpool handle uses nonblocking allocation
+while the entry mutex is held.
+
+The dedicated QEMU swapoff suite throttles disk writes to observe an unfinished
+batch writer after one completed batch, sends periodic signals during swapoff,
+injects a real read error after initial writes, and constrains an empty cgroup
+that still owns the compressed entries. Read/charge failure keeps the device
+available and permits a successful retry. Lowering that empty cgroup's limit
+produces an expected no-killable-process memcg OOM report, without killing tasks.

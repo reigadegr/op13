@@ -1668,7 +1668,8 @@ static int memcompress_swap_restore(struct memcompress_entry *entry)
 	ret = memcompress_entry_charge(entry, entry->length);
 	if (ret)
 		goto put;
-	ret = zpool_malloc(memcompress_pool, entry->length, GFP_NOIO, &handle);
+	ret = zpool_malloc(memcompress_pool, entry->length,
+			   GFP_NOWAIT | __GFP_NOMEMALLOC | __GFP_NOWARN, &handle);
 	if (ret) {
 		memcompress_entry_uncharge(entry, entry->length);
 		goto put;
@@ -1693,13 +1694,16 @@ int memcompress_swapoff(unsigned int type)
 {
 	struct memcompress_entry *entry;
 	unsigned long index = 0;
-	unsigned int flags;
 	int ret = 0;
 
 	mutex_lock(&memcompress_writeback_lock);
-	flags = memalloc_noreclaim_save();
 	/* Waiting for the mutex also joins any batch using the removed device. */
 	while ((entry = memcompress_next_entry(&index))) {
+		if (signal_pending(current)) {
+			memcompress_entry_put(entry);
+			ret = -EINTR;
+			break;
+		}
 		mutex_lock(memcompress_entry_lock(entry));
 		if (entry->state == MC_SWAPPED && swp_type(entry->spage->swap) == type)
 			ret = memcompress_swap_restore(entry);
@@ -1709,7 +1713,6 @@ int memcompress_swapoff(unsigned int type)
 			break;
 		cond_resched();
 	}
-	memalloc_noreclaim_restore(flags);
 	mutex_unlock(&memcompress_writeback_lock);
 	return ret;
 }
