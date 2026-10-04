@@ -49,6 +49,7 @@ above structured documentation, or deleted if it has served its purpose.
    hugetlbfs_reserv
    ksm
    memory-model
+   memcompress
    mmu_notifier
    multigen_lru
    numa

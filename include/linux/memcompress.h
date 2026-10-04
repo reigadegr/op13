@@ -15,6 +15,7 @@ struct memcompress_reclaim_ctx;
 enum memcompress_reclaim_source {
 	MEMCOMPRESS_RECLAIM_DIRECT,
 	MEMCOMPRESS_RECLAIM_KSWAPD,
+	/* Admission classes; the current port does not create worker tasks. */
 	MEMCOMPRESS_RECLAIM_WORKER,
 	MEMCOMPRESS_RECLAIM_BURST,
 	MEMCOMPRESS_RECLAIM_SOURCE_NR,
@@ -88,6 +89,7 @@ void memcompress_load_folio_commit(struct memcompress_entry *entry);
 void memcompress_load_folio_abort(struct memcompress_entry *entry);
 int memcompress_migrate_folio(struct folio *dst, struct folio *src);
 void memcompress_migrate_folio_rollback(struct folio *dst, struct folio *src);
+/* Account base pages in flight; this does not enqueue or schedule work. */
 void memcompress_reclaim_queue(int nid, unsigned int nr_pages);
 void memcompress_reclaim_complete(int nid, unsigned int nr_pages, bool success);
 bool memcompress_reclaim_inflight(int nid);
